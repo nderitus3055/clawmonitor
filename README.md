@@ -17,16 +17,12 @@ cd ~/program/clawmonitor
 python3 -m pip install -e .
 ```
 
-## Install (PyPI / uv / pipx)
+## Install (PyPI)
 
 Once published to PyPI, you’ll be able to install via:
 
 ```bash
 pip install clawmonitor
-# or
-pipx install clawmonitor
-# or
-uv tool install clawmonitor
 ```
 
 ## Run

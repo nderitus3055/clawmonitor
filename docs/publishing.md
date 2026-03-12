@@ -37,13 +37,11 @@ Use SemVer-ish tags:
 - Prefer exporting a redacted report: `clawmonitor report --session-key ... --format md` (or `both`).
 - Reports are written to `~/.local/state/clawmonitor/reports/` (XDG state dir), not into the repo.
 
-## PyPI (pip / uv / pipx)
+## PyPI (pip)
 
 If you publish to PyPI:
 
 - `pip install clawmonitor`
-- `pipx install clawmonitor`
-- `uv tool install clawmonitor`
 
 Suggested release flow:
 
@@ -60,7 +58,24 @@ You can set up CI to:
 - build `sdist` + `wheel`
 - (optional) publish to PyPI on tags via “Trusted Publisher” (no secrets committed)
 
-See PyPI docs: configure the project to trust your GitHub repo/workflow, then the workflow can publish on tag.
+### PyPI “Trusted Publishing” authorization (OIDC)
+
+This repo already includes a workflow: `.github/workflows/pypi-publish.yml` (runs on tags like `v0.1.1`).
+
+To authorize it on PyPI (no secrets in the repo):
+
+1) Create a PyPI account (if you don’t have one).
+2) Create the project on PyPI:
+   - Project name: `clawmonitor`
+3) In the PyPI project settings, add a “Trusted Publisher”:
+   - Provider: GitHub
+   - Owner: `openclawq`
+   - Repository: `clawmonitor`
+   - Workflow filename: `pypi-publish.yml`
+   - Environment: (leave blank unless you set one)
+4) After that, pushing a tag `vX.Y.Z` will publish automatically.
+
+If you prefer manual publishing instead, you can use a PyPI API token + `twine`, but trusted publishing is recommended.
 
 ## Packaging as an OpenClaw skill (wrapper)
 
