@@ -22,6 +22,7 @@ from .state import compute_state
 from .status_cli import collect_status, format_json as format_status_json, format_markdown as format_status_markdown, format_table, watch_loop
 from .transcript_tail import TranscriptTail, tail_transcript
 from .tui import ClawMonitorTUI
+from .tree_cli import format_tree
 
 
 def _config_with_overrides(cfg_path: Optional[str], openclaw_root: Optional[str]) -> Any:
@@ -219,6 +220,19 @@ def cmd_report(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_tree(args: argparse.Namespace) -> int:
+    cfg = _config_with_overrides(args.config, args.openclaw_root)
+    rows = collect_status(
+        openclaw_root=cfg.openclaw_root,
+        openclaw_bin=cfg.openclaw_bin,
+        transcript_tail_bytes=cfg.transcript_tail_bytes,
+        hide_system_sessions=args.hide_system if args.hide_system is not None else cfg.hide_system_sessions,
+        include_gateway_channels=not args.no_gateway,
+    )
+    print(format_tree(rows, include_task=not bool(args.no_task)))
+    return 0
+
+
 def cmd_watch(args: argparse.Namespace) -> int:
     cfg = _config_with_overrides(args.config, args.openclaw_root)
     watch_loop(
@@ -328,6 +342,12 @@ def main() -> None:
     status.add_argument("--hide-system", action="store_true", help="Hide systemSent sessions")
     status.add_argument("--no-gateway", action="store_true", help="Disable Gateway enrichment (channels/logs)")
     status.set_defaults(func=cmd_status)
+
+    tree = sub.add_parser("tree", help="Print a tree-ish view grouped by agent")
+    tree.add_argument("--hide-system", action="store_true", help="Hide systemSent sessions")
+    tree.add_argument("--no-gateway", action="store_true", help="Disable Gateway enrichment (channels/logs)")
+    tree.add_argument("--no-task", action="store_true", help="Do not include task previews")
+    tree.set_defaults(func=cmd_tree)
 
     rep = sub.add_parser("report", help="Export a single-session report (JSON/MD)")
     rep.add_argument("--session-key", required=True)
