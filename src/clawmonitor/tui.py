@@ -20,6 +20,7 @@ from .redact import redact_text
 from .reports import write_report_files
 from .session_store import SessionMeta, list_sessions
 from .state import SessionComputed, WorkState, compute_state
+from .thread_bindings import TelegramThreadBinding, load_telegram_thread_bindings
 from .transcript_tail import TranscriptTail, tail_transcript
 
 
@@ -197,6 +198,8 @@ class SessionView:
     findings: List[Finding]
     updated_at: Optional[datetime]
     transcript_missing: bool
+    telegram_binding: Optional[TelegramThreadBinding]
+    telegram_routed_elsewhere: bool
 
 
 class MonitorModel:
@@ -211,6 +214,8 @@ class MonitorModel:
         self._gateway_last_poll = 0.0
         self._channels: Optional[ChannelsSnapshot] = None
         self._channels_last_poll = 0.0
+        self._telegram_bindings: Dict[str, Dict[str, TelegramThreadBinding]] = {}
+        self._telegram_bindings_last_load = 0.0
 
     @property
     def gateway_log_tailer(self) -> GatewayLogTailer:
@@ -261,10 +266,31 @@ class MonitorModel:
         except Exception:
             return TranscriptTail(None, None, None, None, None, None)
 
+    def _refresh_telegram_bindings(self) -> None:
+        # Lightweight local file read; throttle to avoid needless IO.
+        now = time.time()
+        if now - self._telegram_bindings_last_load < 2.0:
+            return
+        # Today we only need the default account; keep dict-of-dicts to allow
+        # multi-account expansion later.
+        bindings = load_telegram_thread_bindings(self.cfg.openclaw_root, account_id="default")
+        self._telegram_bindings = {"default": bindings}
+        self._telegram_bindings_last_load = now
+
+    def _telegram_binding_for(self, *, account_id: Optional[str], to: Optional[str]) -> Optional[TelegramThreadBinding]:
+        if not to or not isinstance(to, str) or not to.startswith("telegram:"):
+            return None
+        conv_id = to.split("telegram:", 1)[1].strip()
+        if not conv_id:
+            return None
+        aid = (account_id or "default").strip() or "default"
+        return (self._telegram_bindings.get(aid) or {}).get(conv_id)
+
     def refresh(self) -> None:
         self._refresh_delivery_map()
         self._refresh_gateway_logs()
         self._refresh_channels()
+        self._refresh_telegram_bindings()
 
         metas = list_sessions(self.cfg.openclaw_root)
         views: List[SessionView] = []
@@ -285,6 +311,12 @@ class MonitorModel:
                 gateway_lines=self._gateway_logs.lines,
             )
             transcript_missing = bool(meta.session_file) and not bool(meta.session_file.exists())
+            telegram_binding: Optional[TelegramThreadBinding] = None
+            telegram_routed_elsewhere = False
+            if (meta.channel or "") == "telegram":
+                telegram_binding = self._telegram_binding_for(account_id=meta.account_id, to=meta.to)
+                if telegram_binding and telegram_binding.target_session_key and telegram_binding.target_session_key != meta.key:
+                    telegram_routed_elsewhere = True
             views.append(
                 SessionView(
                     meta=meta,
@@ -295,6 +327,8 @@ class MonitorModel:
                     findings=findings,
                     updated_at=_dt_from_ms(meta.updated_at_ms),
                     transcript_missing=transcript_missing,
+                    telegram_binding=telegram_binding,
+                    telegram_routed_elsewhere=telegram_routed_elsewhere,
                 )
             )
         self._sessions = views
@@ -419,6 +453,8 @@ class ClawMonitorTUI:
                 flags.append("SAFE")
             if sv.transcript_missing:
                 flags.append("TRXM")
+            if sv.telegram_routed_elsewhere:
+                flags.append("BIND")
             flags.extend(_agent_markers(sv.meta))
             flag_str = ",".join(flags)
             line = (
@@ -479,6 +515,14 @@ class ClawMonitorTUI:
                 lines.append(f"Transcript: MISSING ({sv.meta.session_file})")
             else:
                 lines.append(f"Transcript: {sv.meta.session_file}")
+        if sv.telegram_binding:
+            b = sv.telegram_binding
+            note = ""
+            if sv.telegram_routed_elsewhere:
+                note = "  (ROUTED ELSEWHERE)"
+            lines.append(
+                f"Telegram Binding: conv={b.conversation_id} -> {b.target_session_key} kind={b.target_kind or '-'} agent={b.agent_id or '-'}{note}"
+            )
         lines.append(f"State: {sv.computed.state.value}  Reason: {sv.computed.reason}")
         if sv.lock:
             lines.append(f"Lock: pid={sv.lock.pid} alive={sv.lock.pid_alive} createdAt={_fmt_dt(sv.lock.created_at)}")
@@ -543,6 +587,12 @@ class ClawMonitorTUI:
             f"Transcript: {'MISSING' if sv.transcript_missing else ('-' if not sv.meta.session_file else 'OK')}",
             f"State: {sv.computed.state.value}  Reason: {sv.computed.reason}",
         ]
+        if sv.telegram_binding:
+            b = sv.telegram_binding
+            note = " (ROUTED ELSEWHERE)" if sv.telegram_routed_elsewhere else ""
+            status_lines.append(
+                f"Telegram Binding: conv={b.conversation_id} -> {b.target_session_key} kind={b.target_kind or '-'} agent={b.agent_id or '-'}{note}"
+            )
         if sv.lock:
             status_lines.append(f"Lock: pid={sv.lock.pid} alive={sv.lock.pid_alive} createdAt={_fmt_dt(sv.lock.created_at)}")
         else:
@@ -651,6 +701,12 @@ class ClawMonitorTUI:
             f"Transcript: {'MISSING' if sv.transcript_missing else ('-' if not sv.meta.session_file else 'OK')}",
             f"State: {sv.computed.state.value}  Reason: {sv.computed.reason}",
         ]
+        if sv.telegram_binding:
+            b = sv.telegram_binding
+            note = " (ROUTED ELSEWHERE)" if sv.telegram_routed_elsewhere else ""
+            status_lines.append(
+                f"Telegram Binding: conv={b.conversation_id} -> {b.target_session_key} kind={b.target_kind or '-'} agent={b.agent_id or '-'}{note}"
+            )
         if sv.lock:
             status_lines.append(f"Lock: pid={sv.lock.pid} alive={sv.lock.pid_alive} createdAt={_fmt_dt(sv.lock.created_at)}")
         else:

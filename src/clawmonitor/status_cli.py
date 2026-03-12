@@ -13,6 +13,7 @@ from .openclaw_config import read_openclaw_config_snapshot
 from .redact import redact_text
 from .session_store import SessionMeta, list_sessions
 from .state import WorkState, compute_state
+from .thread_bindings import load_telegram_thread_bindings
 from .transcript_tail import TranscriptTail, tail_transcript
 
 
@@ -83,6 +84,7 @@ def collect_status(
     delivery_map = load_failed_delivery_map(openclaw_root)
     cfg_snapshot = read_openclaw_config_snapshot(openclaw_root)
     channels = fetch_channels_status(openclaw_bin) if include_gateway_channels else None
+    telegram_bindings = load_telegram_thread_bindings(openclaw_root, account_id="default")
 
     rows: List[StatusRow] = []
     for meta in metas:
@@ -107,6 +109,14 @@ def collect_status(
             flags.append("SAFETY")
         if computed.safeguard_alert:
             flags.append("SAFEGUARD_OFF")
+
+        # Telegram routing: if a conversation is bound to a different session key,
+        # this session will never receive new inbound for that chat.
+        if (meta.channel or "") == "telegram" and meta.to and meta.to.startswith("telegram:"):
+            conv_id = meta.to.split("telegram:", 1)[1].strip()
+            b = telegram_bindings.get(conv_id)
+            if b and b.target_session_key and b.target_session_key != meta.key:
+                flags.append("BOUND_OTHER")
 
         run_for = "-"
         if lock and lock.created_at:
