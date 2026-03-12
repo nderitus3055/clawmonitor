@@ -18,6 +18,7 @@ python3 -m pip install -e .
 ## Run
 
 ```bash
+clawmonitor init
 clawmonitor tui
 ```
 
@@ -52,6 +53,7 @@ Runtime data (NOT stored in this repo):
 
 - `↑/↓`: move selection
 - `Enter`: nudge selected session (choose template)
+- `?`: show help overlay
 - `l`: toggle related logs panel
 - `d`: re-run diagnosis for selected session
 - `e`: export a redacted report for selected session
@@ -60,6 +62,12 @@ Runtime data (NOT stored in this repo):
 - `q`: quit
 
 Rows are color-coded when your terminal supports colors (`OK` green, `RUN` cyan, `IDLE` yellow, `ALERT` red).
+
+## First run
+
+If no config file exists, most commands will offer to run the init wizard (interactive terminals only).
+
+See `docs/launch-post.md` for a longer intro.
 
 ## Notes
 
