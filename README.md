@@ -1,5 +1,7 @@
 # ClawMonitor
 
+English | [简体中文](README.zh-CN.md)
+
 Real-time **OpenClaw** session monitor with:
 
 - Per-session last inbound **user** message + last outbound **assistant** message (preview + timestamp)
