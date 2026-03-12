@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import time
+import re
 
 from .actions import TEMPLATES, send_nudge
 from .channels_status import ChannelsSnapshot, fetch_channels_status
@@ -20,6 +21,9 @@ from .reports import write_report_files
 from .session_store import SessionMeta, list_sessions
 from .state import SessionComputed, WorkState, compute_state
 from .transcript_tail import TranscriptTail, tail_transcript
+
+
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 
 def _fmt_dt(dt: Optional[datetime]) -> str:
@@ -90,6 +94,26 @@ def _wrap_lines(text: str, width: int, max_lines: int) -> List[str]:
         if last and not last.endswith("…") and width >= 1 and len(last) == width:
             lines[-1] = (last[: max(0, width - 1)] + "…")[:width]
     return lines
+
+
+def _sanitize_for_curses(text: str) -> str:
+    """
+    Curses writes can be corrupted by control characters (\\n/\\r/ANSI escapes),
+    which may move the cursor and visually "spill" across panels.
+    """
+    if not text:
+        return ""
+    s = _ANSI_ESCAPE_RE.sub("", text)
+    out: List[str] = []
+    for ch in s:
+        o = ord(ch)
+        if ch in ("\n", "\r", "\t"):
+            out.append(" ")
+        elif o < 32 or o == 127:
+            out.append(" ")
+        else:
+            out.append(ch)
+    return "".join(out)
 
 
 def _agent_markers(meta: SessionMeta) -> List[str]:
@@ -288,6 +312,7 @@ class ClawMonitorTUI:
         maxw = min(width, w - x)
         if maxw <= 0:
             return
+        text = _sanitize_for_curses(text)
         try:
             if attr:
                 stdscr.addnstr(y, x, text, maxw, attr)
