@@ -16,7 +16,7 @@ from .eventlog import EventLog
 from .gateway_logs import GatewayLogTailer
 from .locks import LockInfo, lock_path_for_session_file, read_lock
 from .redact import redact_text
-from .reports import write_report
+from .reports import write_report_files
 from .session_store import SessionMeta, list_sessions
 from .state import SessionComputed, WorkState, compute_state
 from .transcript_tail import TranscriptTail, tail_transcript
@@ -48,6 +48,94 @@ def _fmt_age(age: Optional[int]) -> str:
     if age < 3600:
         return f"{age//60:>3}m"
     return f"{age//3600:>3}h"
+
+
+def _fit(text: str, width: int) -> str:
+    if width <= 0:
+        return ""
+    if len(text) <= width:
+        return text.ljust(width)
+    if width <= 1:
+        return text[:width]
+    return (text[: width - 1] + "…")[:width]
+
+
+def _wrap_lines(text: str, width: int, max_lines: int) -> List[str]:
+    if width <= 0 or max_lines <= 0:
+        return []
+    t = (text or "").replace("\t", " ").strip()
+    if not t:
+        return []
+    words = t.split()
+    lines: List[str] = []
+    cur: List[str] = []
+    cur_len = 0
+    for w in words:
+        if not cur:
+            cur = [w]
+            cur_len = len(w)
+        elif cur_len + 1 + len(w) <= width:
+            cur.append(w)
+            cur_len += 1 + len(w)
+        else:
+            lines.append(" ".join(cur)[:width])
+            cur = [w]
+            cur_len = len(w)
+        if len(lines) >= max_lines:
+            break
+    if len(lines) < max_lines and cur:
+        lines.append(" ".join(cur)[:width])
+    if len(lines) == max_lines:
+        last = lines[-1]
+        if last and not last.endswith("…") and width >= 1 and len(last) == width:
+            lines[-1] = (last[: max(0, width - 1)] + "…")[:width]
+    return lines
+
+
+def _agent_markers(meta: SessionMeta) -> List[str]:
+    markers: List[str] = []
+    kind = ((meta.kind or "") + " " + (meta.chat_type or "")).lower()
+    aid = (meta.agent_id or "").lower()
+    if "subagent" in kind or "sub-agent" in kind:
+        markers.append("SUBAG")
+    if "codex" in kind or aid.startswith("codex") or "codex" in aid:
+        markers.append("CODEX")
+    return markers
+
+
+def _health_class(
+    *,
+    state: WorkState,
+    no_feedback: bool,
+    delivery_failed: bool,
+    safety_alert: bool,
+    safeguard_alert: bool,
+) -> str:
+    if no_feedback:
+        return "alert"
+    if delivery_failed:
+        return "alert"
+    if safety_alert or safeguard_alert:
+        return "alert"
+    if state == WorkState.INTERRUPTED:
+        return "alert"
+    if state == WorkState.WORKING:
+        return "working"
+    if state == WorkState.NO_MESSAGE:
+        return "idle"
+    return "ok"
+
+
+def _health_label(cls: str) -> str:
+    if cls == "ok":
+        return "OK"
+    if cls == "working":
+        return "RUN"
+    if cls == "idle":
+        return "IDLE"
+    if cls == "alert":
+        return "ALERT"
+    return cls.upper()[:6]
 
 
 @dataclass
@@ -157,9 +245,31 @@ class ClawMonitorTUI:
         self.selected = 0
         self.scroll = 0
         self.show_logs = True
+        self.refresh_seconds = float(cfg.ui_seconds)
+        self._last_refresh_at: Optional[float] = None
+        self._colors_enabled = False
+        self._color_ok = 0
+        self._color_working = 0
+        self._color_idle = 0
+        self._color_alert = 0
 
     def run(self) -> None:
         curses.wrapper(self._main)
+
+    def _row_attr(self, health_cls: str, *, selected: bool) -> int:
+        attr = curses.A_NORMAL
+        if self._colors_enabled:
+            if health_cls == "ok":
+                attr |= self._color_ok
+            elif health_cls == "working":
+                attr |= self._color_working
+            elif health_cls == "idle":
+                attr |= self._color_idle
+            elif health_cls == "alert":
+                attr |= self._color_alert
+        if selected:
+            attr |= curses.A_REVERSE
+        return attr
 
     def _safe_addnstr(
         self,
@@ -199,7 +309,11 @@ class ClawMonitorTUI:
             self._safe_addnstr(stdscr, 1, 0, f"Channels: (unavailable) {err or ''}".ljust(width), width)
 
     def _draw_list(self, stdscr: "curses._CursesWindow", y: int, h: int, w: int, sessions: List[SessionView]) -> None:
-        header = "AGENT  CHAN      STATE        U-AGE  A-AGE  RUN   FLAGS  SESSION"
+        agent_w = 10
+        chan_w = 8
+        state_w = 11
+        flags_w = 12
+        header = f"{_fit('AGENT', agent_w)}  {_fit('CHAN', chan_w)}  {_fit('STATE', state_w)}  U-AGE  A-AGE  RUN   {_fit('FLAGS', flags_w)}  SESSION"
         self._safe_addnstr(stdscr, y, 0, header.ljust(w), w, curses.A_BOLD)
         body_y = y + 1
         visible = h - 1
@@ -220,6 +334,14 @@ class ClawMonitorTUI:
             if sv.lock and sv.lock.created_at:
                 run = _fmt_age(int((datetime.now(timezone.utc) - sv.lock.created_at).total_seconds()))
             flags: List[str] = []
+            health_cls = _health_class(
+                state=sv.computed.state,
+                no_feedback=sv.computed.no_feedback,
+                delivery_failed=sv.delivery_failure is not None,
+                safety_alert=sv.computed.safety_alert,
+                safeguard_alert=sv.computed.safeguard_alert,
+            )
+            flags.append(_health_label(health_cls))
             if sv.computed.no_feedback:
                 flags.append("NOFB")
             if sv.delivery_failure:
@@ -228,9 +350,17 @@ class ClawMonitorTUI:
                 flags.append("ZLOCK")
             if sv.computed.safety_alert:
                 flags.append("SAFE")
-            flag_str = ",".join(flags)[:8]
-            line = f"{sv.meta.agent_id[:5]:<5}  {(sv.meta.channel or '-')[:8]:<8}  {sv.computed.state.value:<11}  {u_age:>5}  {a_age:>5}  {run:>5}  {flag_str:<6}  {sv.meta.key}"
-            attr = curses.A_REVERSE if idx == self.selected else curses.A_NORMAL
+            flags.extend(_agent_markers(sv.meta))
+            flag_str = ",".join(flags)
+            line = (
+                f"{_fit(sv.meta.agent_id, agent_w)}  "
+                f"{_fit((sv.meta.channel or '-'), chan_w)}  "
+                f"{_fit(sv.computed.state.value, state_w)}  "
+                f"{u_age:>5}  {a_age:>5}  {run:>5}  "
+                f"{_fit(flag_str, flags_w)}  "
+                f"{sv.meta.key}"
+            )
+            attr = self._row_attr(health_cls, selected=(idx == self.selected))
             self._safe_addnstr(stdscr, row_y, 0, line.ljust(w), w, attr)
 
     def _draw_details(self, stdscr: "curses._CursesWindow", x: int, y: int, h: int, w: int, sv: Optional[SessionView]) -> None:
@@ -238,7 +368,11 @@ class ClawMonitorTUI:
             return
         lines: List[str] = []
         lines.append(f"SessionKey: {sv.meta.key}")
-        lines.append(f"Agent: {sv.meta.agent_id}  Channel: {sv.meta.channel or '-'}  Account: {sv.meta.account_id or '-'}")
+        markers = _agent_markers(sv.meta)
+        mark_str = f" ({','.join(markers)})" if markers else ""
+        lines.append(f"Agent: {sv.meta.agent_id}{mark_str}  Channel: {sv.meta.channel or '-'}  Account: {sv.meta.account_id or '-'}")
+        if sv.meta.kind or sv.meta.chat_type:
+            lines.append(f"Kind: {sv.meta.kind or '-'}  ChatType: {sv.meta.chat_type or '-'}")
         lines.append(f"State: {sv.computed.state.value}  Reason: {sv.computed.reason}")
         if sv.lock:
             lines.append(f"Lock: pid={sv.lock.pid} alive={sv.lock.pid_alive} createdAt={_fmt_dt(sv.lock.created_at)}")
@@ -248,13 +382,15 @@ class ClawMonitorTUI:
         lines.append("")
         if sv.tail.last_user:
             lines.append(f"Last USER @ {_fmt_dt(sv.tail.last_user.ts)}")
-            lines.append(f"  {redact_text(sv.tail.last_user.preview)}")
+            for part in _wrap_lines(redact_text(sv.tail.last_user.preview), max(0, w - 2), max_lines=3):
+                lines.append(f"  {part}")
         else:
             lines.append("Last USER: -")
         lines.append("")
         if sv.tail.last_assistant:
             lines.append(f"Last ASST @ {_fmt_dt(sv.tail.last_assistant.ts)}  stopReason={sv.tail.last_assistant.stop_reason or '-'}")
-            lines.append(f"  {redact_text(sv.tail.last_assistant.preview)}")
+            for part in _wrap_lines(redact_text(sv.tail.last_assistant.preview), max(0, w - 2), max_lines=4):
+                lines.append(f"  {part}")
         else:
             lines.append("Last ASST: -")
         if sv.delivery_failure:
@@ -273,22 +409,24 @@ class ClawMonitorTUI:
             rel = related_logs(self.model.gateway_log_tailer.lines, sv.meta.key, sv.meta.channel, sv.meta.account_id, limit=50)
             rel_logs = [ln.text for ln in rel][-20:]
 
-        max_lines = h
-        for i in range(min(max_lines, len(lines))):
+        log_budget = 0
+        if self.show_logs:
+            log_budget = min(10, max(0, h // 3))
+        detail_h = max(0, h - (log_budget + (1 if log_budget else 0)))
+
+        for i in range(min(detail_h, len(lines))):
             self._safe_addnstr(stdscr, y + i, x, lines[i].ljust(w), w)
-        for j in range(len(lines), max_lines):
+        for j in range(len(lines), detail_h):
             self._safe_addnstr(stdscr, y + j, x, " ".ljust(w), w)
 
-        if self.show_logs:
-            log_y = y + min(max_lines, len(lines))
-            if log_y < y + h - 1:
-                self._safe_addnstr(stdscr, log_y, x, "Related Logs:".ljust(w), w, curses.A_BOLD)
-                log_y += 1
-                for ln in rel_logs[: (y + h - log_y)]:
-                    if log_y >= y + h:
-                        break
-                    self._safe_addnstr(stdscr, log_y, x, ln[:w].ljust(w), w)
-                    log_y += 1
+        if self.show_logs and log_budget:
+            log_y = y + detail_h
+            self._safe_addnstr(stdscr, log_y, x, "Related Logs:".ljust(w), w, curses.A_BOLD)
+            log_y += 1
+            for i in range(min(log_budget, len(rel_logs))):
+                self._safe_addnstr(stdscr, log_y + i, x, rel_logs[i][:w].ljust(w), w)
+            for j in range(len(rel_logs), log_budget):
+                self._safe_addnstr(stdscr, log_y + j, x, " ".ljust(w), w)
 
     def _template_picker(self, stdscr: "curses._CursesWindow") -> Optional[str]:
         items = list(TEMPLATES.keys())
@@ -331,25 +469,48 @@ class ClawMonitorTUI:
             "last_user_at": _fmt_dt(sv.tail.last_user.ts if sv.tail.last_user else None),
             "last_assistant_at": _fmt_dt(sv.tail.last_assistant.ts if sv.tail.last_assistant else None),
         }
-        path = write_report(
+        paths = write_report_files(
             session_key=sv.meta.key,
             summary=summary,
             findings=sv.findings,
             related_logs=rel,
             max_log_lines=self.cfg.report_max_log_lines,
+            formats=["json", "md"],
         )
-        self.elog.write("report.written", sessionKey=sv.meta.key, path=str(path))
+        for fmt, path in paths.items():
+            self.elog.write("report.written", sessionKey=sv.meta.key, format=fmt, path=str(path))
 
     def _main(self, stdscr: "curses._CursesWindow") -> None:
         curses.curs_set(0)
-        stdscr.nodelay(True)
+        try:
+            if curses.has_colors():
+                curses.start_color()
+                try:
+                    curses.use_default_colors()
+                except Exception:
+                    pass
+                curses.init_pair(1, curses.COLOR_GREEN, -1)
+                curses.init_pair(2, curses.COLOR_YELLOW, -1)
+                curses.init_pair(3, curses.COLOR_CYAN, -1)
+                curses.init_pair(4, curses.COLOR_RED, -1)
+                self._colors_enabled = True
+                self._color_ok = curses.color_pair(1)
+                self._color_working = curses.color_pair(3)
+                self._color_idle = curses.color_pair(2)
+                self._color_alert = curses.color_pair(4)
+        except Exception:
+            self._colors_enabled = False
+        stdscr.timeout(200)
         stdscr.keypad(True)
         last_refresh = 0.0
+        dirty = True
         while True:
             now = time.time()
-            if now - last_refresh >= self.cfg.ui_seconds:
+            if now - last_refresh >= self.refresh_seconds:
                 self.model.refresh()
                 last_refresh = now
+                self._last_refresh_at = now
+                dirty = True
 
             sessions = self.model.sessions
             if sessions and self.selected >= len(sessions):
@@ -357,52 +518,100 @@ class ClawMonitorTUI:
             if self.selected < 0:
                 self.selected = 0
 
-            stdscr.erase()
-            h, w = stdscr.getmaxyx()
-            self._draw_header(stdscr, w)
-
-            list_h = h - 2
-            list_w = max(40, min(max(40, int(w * 0.55)), max(0, w - 20)))
-            detail_w = w - list_w - 1
-            self._draw_list(stdscr, y=2, h=list_h, w=list_w, sessions=sessions)
-            sv = sessions[self.selected] if sessions else None
-            if detail_w >= 20 and list_w < w - 1:
-                try:
-                    stdscr.vline(2, list_w, curses.ACS_VLINE, max(0, h - 2))
-                except curses.error:
-                    pass
-                self._draw_details(stdscr, x=list_w + 1, y=2, h=h - 2, w=detail_w, sv=sv)
-            else:
-                # Terminal too narrow; show a one-line hint.
-                self._safe_addnstr(stdscr, h - 1, 0, "Terminal too narrow for details panel. Widen window or use `clawmonitor status`.".ljust(w), w)
-
-            stdscr.refresh()
-
             try:
                 ch = stdscr.getch()
             except Exception:
                 ch = -1
             if ch == -1:
-                time.sleep(0.05)
-                continue
+                if dirty:
+                    # fall through to redraw
+                    pass
+                else:
+                    continue
             if ch in (ord("q"), 27):
                 return
             if ch in (curses.KEY_UP, ord("k")):
                 self.selected = max(0, self.selected - 1)
+                dirty = True
             elif ch in (curses.KEY_DOWN, ord("j")):
                 self.selected = min(len(sessions) - 1, self.selected + 1) if sessions else 0
+                dirty = True
             elif ch == ord("r"):
                 self.model.refresh()
+                self._last_refresh_at = time.time()
+                dirty = True
             elif ch == ord("l"):
                 self.show_logs = not self.show_logs
+                dirty = True
             elif ch == ord("d"):
                 # Diagnosis is recomputed each refresh; force refresh.
                 self.model.refresh()
-            elif ch == ord("e") and sv:
-                self._export_report(sv)
-            elif ch in (10, 13) and sv:
-                tmpl = self._template_picker(stdscr)
-                if tmpl:
-                    self.elog.write("nudge.sent", sessionKey=sv.meta.key, template=tmpl)
-                    res = send_nudge(self.cfg.openclaw_bin, sv.meta.key, tmpl, deliver=True)
-                    self.elog.write("nudge.result", sessionKey=sv.meta.key, ok=res.ok, runId=res.run_id or "", status=res.status or "", error=res.error or "")
+                self._last_refresh_at = time.time()
+                dirty = True
+            elif ch == ord("f"):
+                opts = [1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 300.0, 600.0]
+                cur = float(self.refresh_seconds)
+                try:
+                    i = opts.index(cur)
+                except ValueError:
+                    i = 2
+                self.refresh_seconds = opts[(i + 1) % len(opts)]
+                dirty = True
+            elif ch in (ord("e"), 10, 13):
+                sv = sessions[self.selected] if sessions else None
+                if ch == ord("e") and sv:
+                    self._export_report(sv)
+                    dirty = True
+                elif ch in (10, 13) and sv:
+                    tmpl = self._template_picker(stdscr)
+                    if tmpl:
+                        self.elog.write("nudge.sent", sessionKey=sv.meta.key, template=tmpl)
+                        res = send_nudge(self.cfg.openclaw_bin, sv.meta.key, tmpl, deliver=True)
+                        self.elog.write(
+                            "nudge.result",
+                            sessionKey=sv.meta.key,
+                            ok=res.ok,
+                            runId=res.run_id or "",
+                            status=res.status or "",
+                            error=res.error or "",
+                        )
+                    dirty = True
+
+            if not dirty:
+                continue
+
+            stdscr.erase()
+            h, w = stdscr.getmaxyx()
+            self._draw_header(stdscr, w)
+
+            list_h = h - 3
+            list_w = max(52, min(max(52, int(w * 0.55)), max(0, w - 24)))
+            detail_w = w - list_w - 1
+            self._draw_list(stdscr, y=2, h=list_h, w=list_w, sessions=sessions)
+            sv = sessions[self.selected] if sessions else None
+            if detail_w >= 24 and list_w < w - 1:
+                try:
+                    stdscr.vline(2, list_w, curses.ACS_VLINE, max(0, h - 3))
+                except curses.error:
+                    pass
+                self._draw_details(stdscr, x=list_w + 1, y=2, h=h - 3, w=detail_w, sv=sv)
+            else:
+                self._safe_addnstr(
+                    stdscr,
+                    h - 2,
+                    0,
+                    "Terminal too narrow for details panel. Widen window or use `clawmonitor status`.".ljust(w),
+                    w,
+                )
+
+            refresh_age = "-"
+            if self._last_refresh_at is not None:
+                refresh_age = _fmt_age(int(time.time() - self._last_refresh_at))
+            footer = (
+                f"[q]quit [↑↓]select [r]refresh [f]interval={int(self.refresh_seconds)}s "
+                f"[Enter]nudge [e]export [l]logs  sel={self.selected+1}/{len(sessions)} lastRefresh={refresh_age}"
+            )
+            self._safe_addnstr(stdscr, h - 1, 0, footer.ljust(w), w, curses.A_REVERSE)
+
+            stdscr.refresh()
+            dirty = False
