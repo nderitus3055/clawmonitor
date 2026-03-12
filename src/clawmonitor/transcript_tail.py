@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
+import re
 
 
 def _parse_iso(ts: Any) -> Optional[datetime]:
@@ -43,6 +44,20 @@ def _extract_text(content: Any, max_chars: int = 400) -> str:
     return joined[:max_chars]
 
 
+_INTERNAL_USER_PATTERNS = [
+    re.compile(r"^Skills store policy\s*\(operator configured\):", re.IGNORECASE),
+    re.compile(r"^Conversation info \(untrusted metadata\):", re.IGNORECASE),
+    re.compile(r"^Sender \(untrusted metadata\):", re.IGNORECASE),
+]
+
+
+def _is_internal_user_text(text: str) -> bool:
+    s = (text or "").strip()
+    if not s:
+        return False
+    return any(p.search(s) for p in _INTERNAL_USER_PATTERNS)
+
+
 @dataclass(frozen=True)
 class TailMessage:
     role: str
@@ -53,7 +68,11 @@ class TailMessage:
 
 @dataclass(frozen=True)
 class TranscriptTail:
+    # last_user: the newest role=user message (may include internal triggers).
     last_user: Optional[TailMessage]
+    # last_user_send: best-effort "real inbound" user message, skipping common internal
+    # control-plane injections used by CLI/harness.
+    last_user_send: Optional[TailMessage]
     last_assistant: Optional[TailMessage]
     last_tool_error: Optional[Tuple[Optional[datetime], str]]
     last_compaction_at: Optional[datetime]
@@ -61,7 +80,7 @@ class TranscriptTail:
 
 def tail_transcript(path: Path, max_bytes: int = 65536) -> TranscriptTail:
     if not path.exists():
-        return TranscriptTail(None, None, None, None)
+        return TranscriptTail(None, None, None, None, None)
     # Read backwards in growing chunks until we find both last user and last assistant
     # (or we hit an upper bound).
     max_total = max(256 * 1024, min(2 * 1024 * 1024, max_bytes * 16))
@@ -69,7 +88,7 @@ def tail_transcript(path: Path, max_bytes: int = 65536) -> TranscriptTail:
     try:
         size = path.stat().st_size
     except Exception:
-        return TranscriptTail(None, None, None, None)
+        return TranscriptTail(None, None, None, None, None)
 
     gathered_text = ""
     read_total = 0
@@ -95,6 +114,7 @@ def tail_transcript(path: Path, max_bytes: int = 65536) -> TranscriptTail:
     lines = [ln for ln in gathered_text.splitlines() if ln.strip().startswith("{")]
 
     last_user: Optional[TailMessage] = None
+    last_user_send: Optional[TailMessage] = None
     last_assistant: Optional[TailMessage] = None
     last_tool_error: Optional[Tuple[Optional[datetime], str]] = None
     last_compaction_at: Optional[datetime] = None
@@ -131,8 +151,12 @@ def tail_transcript(path: Path, max_bytes: int = 65536) -> TranscriptTail:
                 last_tool_error = (ts, summary)
             continue
 
-        if role == "user" and last_user is None:
-            last_user = TailMessage(role="user", ts=ts, preview=_extract_text(msg.get("content")))
+        if role == "user":
+            preview = _extract_text(msg.get("content"))
+            if last_user is None:
+                last_user = TailMessage(role="user", ts=ts, preview=preview)
+            if last_user_send is None and not _is_internal_user_text(preview):
+                last_user_send = TailMessage(role="user", ts=ts, preview=preview)
             continue
 
         if role == "assistant" and last_assistant is None:
@@ -145,7 +169,13 @@ def tail_transcript(path: Path, max_bytes: int = 65536) -> TranscriptTail:
             )
             continue
 
-        if last_user and last_assistant and last_tool_error and last_compaction_at:
+        if last_user and last_user_send and last_assistant and last_tool_error and last_compaction_at:
             break
 
-    return TranscriptTail(last_user=last_user, last_assistant=last_assistant, last_tool_error=last_tool_error, last_compaction_at=last_compaction_at)
+    return TranscriptTail(
+        last_user=last_user,
+        last_user_send=last_user_send,
+        last_assistant=last_assistant,
+        last_tool_error=last_tool_error,
+        last_compaction_at=last_compaction_at,
+    )

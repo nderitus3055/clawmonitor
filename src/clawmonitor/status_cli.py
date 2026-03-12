@@ -76,7 +76,8 @@ def collect_status(
     for meta in metas:
         if hide_system_sessions and meta.system_sent:
             continue
-        tail = tail_transcript(meta.session_file, max_bytes=transcript_tail_bytes) if meta.session_file else TranscriptTail(None, None, None, None)
+        tail = tail_transcript(meta.session_file, max_bytes=transcript_tail_bytes) if meta.session_file else TranscriptTail(None, None, None, None, None)
+        user_msg = tail.last_user_send or tail.last_user
         lock = read_lock(lock_path_for_session_file(meta.session_file)) if meta.session_file else None
         df = delivery_map.get(meta.key)
         compaction_cfg = cfg_snapshot.compaction_by_agent.get(meta.agent_id) or cfg_snapshot.compaction_by_agent.get("main")
@@ -107,9 +108,9 @@ def collect_status(
                 key=meta.key,
                 state=computed.state.value,
                 flags=flags,
-                last_user_at=_fmt_dt(tail.last_user.ts if tail.last_user else None),
+                last_user_at=_fmt_dt(user_msg.ts if user_msg else None),
                 last_assistant_at=_fmt_dt(tail.last_assistant.ts if tail.last_assistant else None),
-                user_age=_fmt_age(_age_seconds(tail.last_user.ts if tail.last_user else None)),
+                user_age=_fmt_age(_age_seconds(user_msg.ts if user_msg else None)),
                 assistant_age=_fmt_age(_age_seconds(tail.last_assistant.ts if tail.last_assistant else None)),
                 run_for=run_for,
                 reason=computed.reason,

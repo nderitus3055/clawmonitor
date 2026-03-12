@@ -149,7 +149,8 @@ def cmd_report(args: argparse.Namespace) -> int:
     if not meta:
         raise SystemExit(f"Unknown sessionKey: {args.session_key}")
 
-    tail = tail_transcript(meta.session_file, max_bytes=cfg.transcript_tail_bytes) if meta.session_file else TranscriptTail(None, None, None, None)
+    tail = tail_transcript(meta.session_file, max_bytes=cfg.transcript_tail_bytes) if meta.session_file else TranscriptTail(None, None, None, None, None)
+    user_msg = tail.last_user_send or tail.last_user
     lock = read_lock(lock_path_for_session_file(meta.session_file)) if meta.session_file else None
     delivery_map = load_failed_delivery_map(cfg.openclaw_root)
     df = delivery_map.get(meta.key)
@@ -186,9 +187,9 @@ def cmd_report(args: argparse.Namespace) -> int:
         "safeguard_alert": computed.safeguard_alert,
         "aborted_last_run": meta.aborted_last_run,
         "system_sent": meta.system_sent,
-        "last_user_at": tail.last_user.ts.isoformat() if tail.last_user and tail.last_user.ts else None,
+        "last_user_at": user_msg.ts.isoformat() if user_msg and user_msg.ts else None,
         "last_assistant_at": tail.last_assistant.ts.isoformat() if tail.last_assistant and tail.last_assistant.ts else None,
-        "last_user_preview": redact_text(tail.last_user.preview) if tail.last_user else None,
+        "last_user_preview": redact_text(user_msg.preview) if user_msg else None,
         "last_assistant_preview": redact_text(tail.last_assistant.preview) if tail.last_assistant else None,
     }
 

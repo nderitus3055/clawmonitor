@@ -237,7 +237,7 @@ class MonitorModel:
 
     def _tail_for(self, session_file: Optional[Path]) -> TranscriptTail:
         if not session_file:
-            return TranscriptTail(None, None, None, None)
+            return TranscriptTail(None, None, None, None, None)
         try:
             st = session_file.stat()
             key = session_file
@@ -248,7 +248,7 @@ class MonitorModel:
             self._tail_cache[key] = (st.st_mtime, st.st_size, tail)
             return tail
         except Exception:
-            return TranscriptTail(None, None, None, None)
+            return TranscriptTail(None, None, None, None, None)
 
     def refresh(self) -> None:
         self._refresh_delivery_map()
@@ -369,7 +369,8 @@ class ClawMonitorTUI:
                 self._safe_addnstr(stdscr, row_y, 0, " ".ljust(w), w)
                 continue
             sv = sessions[idx]
-            u_age = _fmt_age(_age_seconds(sv.tail.last_user.ts if sv.tail.last_user else None))
+            user_msg = sv.tail.last_user_send or sv.tail.last_user
+            u_age = _fmt_age(_age_seconds(user_msg.ts if user_msg else None))
             a_age = _fmt_age(_age_seconds(sv.tail.last_assistant.ts if sv.tail.last_assistant else None))
             run = "-"
             if sv.lock and sv.lock.created_at:
@@ -454,12 +455,16 @@ class ClawMonitorTUI:
         if sv.delivery_failure:
             lines.append(f"Delivery FAILED: retry={sv.delivery_failure.retry_count} err={redact_text(sv.delivery_failure.last_error or '-')}")
         lines.append("")
-        if sv.tail.last_user:
-            lines.append(f"Last USER @ {_fmt_dt(sv.tail.last_user.ts)}")
-            for part in _wrap_lines(redact_text(sv.tail.last_user.preview), max(0, w - 2), max_lines=3):
+        user_send = sv.tail.last_user_send
+        user_any = sv.tail.last_user
+        user_msg = user_send or user_any
+        if user_msg:
+            label = "Last User Send" if user_send else "Last Trigger (internal)"
+            lines.append(f"{label} @ {_fmt_dt(user_msg.ts)}")
+            for part in _wrap_lines(redact_text(user_msg.preview), max(0, w - 2), max_lines=3):
                 lines.append(f"  {part}")
         else:
-            lines.append("Last USER: -")
+            lines.append("Last User Send: -")
         lines.append("")
         if sv.tail.last_assistant:
             lines.append(f"Last ASST @ {_fmt_dt(sv.tail.last_assistant.ts)}  stopReason={sv.tail.last_assistant.stop_reason or '-'}")
@@ -501,9 +506,15 @@ class ClawMonitorTUI:
             pass
 
         # Column headers
-        self._safe_addnstr(stdscr, y, x1, _fit("Status", col1).ljust(col1), col1, curses.A_BOLD)
-        self._safe_addnstr(stdscr, y, x2, _fit("Last User Send", col2).ljust(col2), col2, curses.A_BOLD)
-        self._safe_addnstr(stdscr, y, x3, _fit("Last Claw Send", col3).ljust(col3), col3, curses.A_BOLD)
+        status_attr = curses.A_BOLD | (self._color_working if self._colors_enabled else 0)
+        user_attr = curses.A_BOLD | (self._color_idle if self._colors_enabled else 0)
+        claw_attr = curses.A_BOLD | (self._color_ok if self._colors_enabled else 0)
+        self._safe_addnstr(stdscr, y, x1, _fit("Status", col1).ljust(col1), col1, status_attr)
+        user_send = sv.tail.last_user_send
+        user_any = sv.tail.last_user
+        user_hdr = "Last User Send" if user_send else ("Last Trigger" if user_any else "Last User Send")
+        self._safe_addnstr(stdscr, y, x2, _fit(user_hdr, col2).ljust(col2), col2, user_attr)
+        self._safe_addnstr(stdscr, y, x3, _fit("Last Claw Send", col3).ljust(col3), col3, claw_attr)
 
         # Status column content
         markers = _agent_markers(sv.meta)
@@ -541,11 +552,12 @@ class ClawMonitorTUI:
             status_lines.append("- (none)")
 
         # User column content
+        user_msg = user_send or user_any
         user_lines: List[str] = []
-        if sv.tail.last_user:
-            user_lines.append(f"at: {_fmt_dt(sv.tail.last_user.ts)}")
+        if user_msg:
+            user_lines.append(f"at: {_fmt_dt(user_msg.ts)}")
             user_lines.append("")
-            user_lines.extend(_wrap_lines(redact_text(sv.tail.last_user.preview), max(0, col2 - 2), max_lines=max(1, h - 4)))
+            user_lines.extend(_wrap_lines(redact_text(user_msg.preview), max(0, col2 - 2), max_lines=max(1, h - 4)))
         else:
             user_lines.append("-")
 
@@ -589,7 +601,10 @@ class ClawMonitorTUI:
             pass
 
         # STATUS pane
-        self._safe_addnstr(stdscr, y_status, x, _fit("Status", w), w, curses.A_BOLD)
+        status_attr = curses.A_BOLD | (self._color_working if self._colors_enabled else 0)
+        user_attr = curses.A_BOLD | (self._color_idle if self._colors_enabled else 0)
+        claw_attr = curses.A_BOLD | (self._color_ok if self._colors_enabled else 0)
+        self._safe_addnstr(stdscr, y_status, x, _fit("Status", w), w, status_attr)
         markers = _agent_markers(sv.meta)
         mark_str = f" ({','.join(markers)})" if markers else ""
         status_lines: List[str] = [
@@ -625,17 +640,21 @@ class ClawMonitorTUI:
             self._safe_addnstr(stdscr, y_status + 1 + i, x, _fit(status_lines[i], w), w)
 
         # USER pane
-        self._safe_addnstr(stdscr, y_user, x, _fit("Last User Send", w), w, curses.A_BOLD)
-        if sv.tail.last_user:
-            self._safe_addnstr(stdscr, y_user + 1, x, _fit(f"@ {_fmt_dt(sv.tail.last_user.ts)}", w), w)
-            msg_lines = _wrap_lines(redact_text(sv.tail.last_user.preview), max(0, w), max_lines=max(0, user_h - 2))
+        user_send = sv.tail.last_user_send
+        user_any = sv.tail.last_user
+        user_hdr = "Last User Send" if user_send else ("Last Trigger (internal)" if user_any else "Last User Send")
+        self._safe_addnstr(stdscr, y_user, x, _fit(user_hdr, w), w, user_attr)
+        user_msg = user_send or user_any
+        if user_msg:
+            self._safe_addnstr(stdscr, y_user + 1, x, _fit(f"@ {_fmt_dt(user_msg.ts)}", w), w)
+            msg_lines = _wrap_lines(redact_text(user_msg.preview), max(0, w), max_lines=max(0, user_h - 2))
             for i, ln in enumerate(msg_lines[: max(0, user_h - 2)]):
                 self._safe_addnstr(stdscr, y_user + 2 + i, x, _fit(ln, w), w)
         else:
             self._safe_addnstr(stdscr, y_user + 1, x, _fit("-", w), w)
 
         # ASSISTANT pane
-        self._safe_addnstr(stdscr, y_asst, x, _fit("Last Claw Send", w), w, curses.A_BOLD)
+        self._safe_addnstr(stdscr, y_asst, x, _fit("Last Claw Send", w), w, claw_attr)
         if sv.tail.last_assistant:
             self._safe_addnstr(stdscr, y_asst + 1, x, _fit(f"@ {_fmt_dt(sv.tail.last_assistant.ts)}  stop={sv.tail.last_assistant.stop_reason or '-'}", w), w)
             msg_lines = _wrap_lines(redact_text(sv.tail.last_assistant.preview), max(0, w), max_lines=max(0, asst_h - 2))
