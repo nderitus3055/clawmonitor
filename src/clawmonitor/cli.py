@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from .actions import TEMPLATES, send_nudge
 from .config import load_config
@@ -11,6 +11,7 @@ from .delivery_queue import load_failed_delivery_map
 from .diagnostics import diagnose, related_logs
 from .eventlog import EventLog
 from .gateway_logs import GatewayLogTailer
+from .init_wizard import maybe_run_first_time_init, run_init
 from .locks import lock_path_for_session_file, read_lock
 from .openclaw_config import read_openclaw_config_snapshot
 from .redact import redact_text
@@ -32,6 +33,25 @@ def _config_with_overrides(cfg_path: Optional[str], openclaw_root: Optional[str]
 def cmd_tui(args: argparse.Namespace) -> int:
     cfg = _config_with_overrides(args.config, args.openclaw_root)
     ClawMonitorTUI(cfg).run()
+    return 0
+
+
+def cmd_init(args: argparse.Namespace) -> int:
+    cfg_path = Path(args.config).expanduser() if args.config else None
+    oc_root = Path(args.openclaw_root).expanduser() if args.openclaw_root else None
+    res = run_init(
+        config_path=cfg_path,
+        lang=args.lang,
+        openclaw_root=oc_root,
+        openclaw_bin=args.openclaw_bin,
+        ui_seconds=args.ui_seconds,
+        defaults=bool(args.defaults),
+        force=bool(args.force),
+    )
+    if not res.ok:
+        raise SystemExit(res.reason or "init failed")
+    if res.path:
+        print(str(res.path))
     return 0
 
 
@@ -217,6 +237,14 @@ def main() -> None:
 
     sub = p.add_subparsers(dest="cmd", required=True)
 
+    init = sub.add_parser("init", help="Interactive setup wizard (writes config.toml)")
+    init.add_argument("--lang", choices=["en", "zh"], help="Language for prompts (default: ask)")
+    init.add_argument("--openclaw-bin", help="OpenClaw CLI binary (default: openclaw)")
+    init.add_argument("--ui-seconds", type=float, help="TUI refresh interval seconds (default: 5.0)")
+    init.add_argument("--defaults", action="store_true", help="Non-interactive; write config with defaults")
+    init.add_argument("--force", action="store_true", help="Overwrite existing config")
+    init.set_defaults(func=cmd_init)
+
     tui = sub.add_parser("tui", help="Run full-screen TUI monitor")
     tui.set_defaults(func=cmd_tui)
 
@@ -256,4 +284,6 @@ def main() -> None:
     watch.set_defaults(func=cmd_watch)
 
     args = p.parse_args()
+    if args.cmd != "init":
+        maybe_run_first_time_init(config_flag=args.config, openclaw_root_flag=args.openclaw_root)
     raise SystemExit(args.func(args))
