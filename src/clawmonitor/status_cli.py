@@ -22,6 +22,15 @@ def _fmt_dt(dt: Optional[datetime]) -> str:
     return dt.astimezone().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _dt_from_ms(ms: Optional[int]) -> Optional[datetime]:
+    if ms is None:
+        return None
+    try:
+        return datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
+    except Exception:
+        return None
+
+
 def _age_seconds(dt: Optional[datetime]) -> Optional[int]:
     if not dt:
         return None
@@ -52,6 +61,9 @@ class StatusRow:
     key: str
     state: str
     flags: List[str]
+    updated_at: str
+    updated_age: str
+    transcript_missing: bool
     last_user_at: str
     last_assistant_at: str
     user_age: str
@@ -100,6 +112,9 @@ def collect_status(
         if lock and lock.created_at:
             run_for = _fmt_age(int((datetime.now(timezone.utc) - lock.created_at).total_seconds()))
 
+        updated_dt = _dt_from_ms(meta.updated_at_ms)
+        transcript_missing = bool(meta.session_file) and not bool(meta.session_file.exists())
+
         rows.append(
             StatusRow(
                 agent_id=meta.agent_id,
@@ -108,6 +123,9 @@ def collect_status(
                 key=meta.key,
                 state=computed.state.value,
                 flags=flags,
+                updated_at=_fmt_dt(updated_dt),
+                updated_age=_fmt_age(_age_seconds(updated_dt)),
+                transcript_missing=transcript_missing,
                 last_user_at=_fmt_dt(user_msg.ts if user_msg else None),
                 last_assistant_at=_fmt_dt(tail.last_assistant.ts if tail.last_assistant else None),
                 user_age=_fmt_age(_age_seconds(user_msg.ts if user_msg else None)),
@@ -121,11 +139,23 @@ def collect_status(
 
 def format_table(rows: List[StatusRow], limit: Optional[int] = None) -> str:
     shown = rows[:limit] if limit else rows
-    header = "AGENT  CHAN      STATE        U_AGE  A_AGE  RUN   FLAGS                SESSION"
+    def fit(text: str, width: int) -> str:
+        s = text or "-"
+        if len(s) <= width:
+            return s.ljust(width)
+        if width <= 1:
+            return s[:width]
+        return (s[: width - 1] + "…")[:width]
+
+    agent_w = max(5, min(16, max((len(r.agent_id or "") for r in shown), default=5)))
+    header = f"{fit('AGENT', agent_w)}  CHAN      STATE        UPD   U_AGE  A_AGE  RUN   FLAGS                SESSION"
     lines = [header]
     for r in shown:
-        flags = ",".join(r.flags)[:20]
-        line = f"{r.agent_id[:5]:<5}  {(r.channel or '-')[:8]:<8}  {r.state:<11}  {r.user_age:>4}  {r.assistant_age:>4}  {r.run_for:>4}  {flags:<20}  {r.key}"
+        flags_list = list(r.flags)
+        if r.transcript_missing and "TRXM" not in flags_list:
+            flags_list.append("TRXM")
+        flags = ",".join(flags_list)[:20]
+        line = f"{fit(r.agent_id, agent_w)}  {(r.channel or '-')[:8]:<8}  {r.state:<11}  {r.updated_age:>4}  {r.user_age:>4}  {r.assistant_age:>4}  {r.run_for:>4}  {flags:<20}  {r.key}"
         lines.append(line)
     return "\n".join(lines)
 
@@ -136,6 +166,7 @@ def format_markdown(rows: List[StatusRow], limit: Optional[int] = None) -> str:
         "agentId",
         "channel",
         "state",
+        "updatedAge",
         "userAge",
         "assistantAge",
         "runFor",
@@ -155,6 +186,7 @@ def format_markdown(rows: List[StatusRow], limit: Optional[int] = None) -> str:
                     esc(r.agent_id),
                     esc(r.channel or "-"),
                     esc(r.state),
+                    esc(r.updated_age),
                     esc(r.user_age),
                     esc(r.assistant_age),
                     esc(r.run_for),
@@ -181,6 +213,9 @@ def format_json(rows: List[StatusRow], openclaw_root: Path) -> str:
                 "key": r.key,
                 "state": r.state,
                 "flags": r.flags,
+                "updatedAt": r.updated_at,
+                "updatedAge": r.updated_age,
+                "transcriptMissing": r.transcript_missing,
                 "lastUserAt": r.last_user_at,
                 "lastAssistantAt": r.last_assistant_at,
                 "userAge": r.user_age,

@@ -132,6 +132,15 @@ def _sanitize_for_curses(text: str) -> str:
     return "".join(out)
 
 
+def _dt_from_ms(ms: Optional[int]) -> Optional[datetime]:
+    if ms is None:
+        return None
+    try:
+        return datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
+    except Exception:
+        return None
+
+
 def _agent_markers(meta: SessionMeta) -> List[str]:
     markers: List[str] = []
     kind = ((meta.kind or "") + " " + (meta.chat_type or "")).lower()
@@ -186,6 +195,8 @@ class SessionView:
     delivery_failure: Optional[DeliveryFailure]
     computed: SessionComputed
     findings: List[Finding]
+    updated_at: Optional[datetime]
+    transcript_missing: bool
 
 
 class MonitorModel:
@@ -273,7 +284,19 @@ class MonitorModel:
                 is_working=computed.state == WorkState.WORKING,
                 gateway_lines=self._gateway_logs.lines,
             )
-            views.append(SessionView(meta=meta, tail=tail, lock=lock, delivery_failure=df, computed=computed, findings=findings))
+            transcript_missing = bool(meta.session_file) and not bool(meta.session_file.exists())
+            views.append(
+                SessionView(
+                    meta=meta,
+                    tail=tail,
+                    lock=lock,
+                    delivery_failure=df,
+                    computed=computed,
+                    findings=findings,
+                    updated_at=_dt_from_ms(meta.updated_at_ms),
+                    transcript_missing=transcript_missing,
+                )
+            )
         self._sessions = views
 
 
@@ -325,7 +348,9 @@ class ClawMonitorTUI:
         h, w = stdscr.getmaxyx()
         if y < 0 or y >= h or x < 0 or x >= w:
             return
-        maxw = min(width, w - x)
+        # Keep a 1-col margin to avoid curses wrapping long/wide strings into the
+        # next line (which can visually "spill" into the left pane).
+        maxw = min(width, max(0, w - x - 1))
         if maxw <= 0:
             return
         text = _sanitize_for_curses(text)
@@ -370,7 +395,7 @@ class ClawMonitorTUI:
                 continue
             sv = sessions[idx]
             user_msg = sv.tail.last_user_send or sv.tail.last_user
-            u_age = _fmt_age(_age_seconds(user_msg.ts if user_msg else None))
+            u_age = _fmt_age(_age_seconds(user_msg.ts if user_msg else sv.updated_at))
             a_age = _fmt_age(_age_seconds(sv.tail.last_assistant.ts if sv.tail.last_assistant else None))
             run = "-"
             if sv.lock and sv.lock.created_at:
@@ -392,6 +417,8 @@ class ClawMonitorTUI:
                 flags.append("ZLOCK")
             if sv.computed.safety_alert:
                 flags.append("SAFE")
+            if sv.transcript_missing:
+                flags.append("TRXM")
             flags.extend(_agent_markers(sv.meta))
             flag_str = ",".join(flags)
             line = (
@@ -446,6 +473,12 @@ class ClawMonitorTUI:
         lines.append(f"Agent: {sv.meta.agent_id}{mark_str}  Channel: {sv.meta.channel or '-'}  Account: {sv.meta.account_id or '-'}")
         if sv.meta.kind or sv.meta.chat_type:
             lines.append(f"Kind: {sv.meta.kind or '-'}  ChatType: {sv.meta.chat_type or '-'}")
+        lines.append(f"UpdatedAt: {_fmt_dt(sv.updated_at)}")
+        if sv.meta.session_file:
+            if sv.transcript_missing:
+                lines.append(f"Transcript: MISSING ({sv.meta.session_file})")
+            else:
+                lines.append(f"Transcript: {sv.meta.session_file}")
         lines.append(f"State: {sv.computed.state.value}  Reason: {sv.computed.reason}")
         if sv.lock:
             lines.append(f"Lock: pid={sv.lock.pid} alive={sv.lock.pid_alive} createdAt={_fmt_dt(sv.lock.created_at)}")
@@ -506,6 +539,8 @@ class ClawMonitorTUI:
         status_lines: List[str] = [
             f"SessionKey: {sv.meta.key}",
             f"Agent: {sv.meta.agent_id}{mark_str}  Channel: {sv.meta.channel or '-'}  Account: {sv.meta.account_id or '-'}",
+            f"UpdatedAt: {_fmt_dt(sv.updated_at)}",
+            f"Transcript: {'MISSING' if sv.transcript_missing else ('-' if not sv.meta.session_file else 'OK')}",
             f"State: {sv.computed.state.value}  Reason: {sv.computed.reason}",
         ]
         if sv.lock:
@@ -612,6 +647,8 @@ class ClawMonitorTUI:
         status_lines: List[str] = [
             f"SessionKey: {sv.meta.key}",
             f"Agent: {sv.meta.agent_id}{mark_str}  Channel: {sv.meta.channel or '-'}  Account: {sv.meta.account_id or '-'}",
+            f"UpdatedAt: {_fmt_dt(sv.updated_at)}",
+            f"Transcript: {'MISSING' if sv.transcript_missing else ('-' if not sv.meta.session_file else 'OK')}",
             f"State: {sv.computed.state.value}  Reason: {sv.computed.reason}",
         ]
         if sv.lock:
