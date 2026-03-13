@@ -188,6 +188,18 @@ def _wrap_lines(text: str, width: int, max_lines: int) -> List[str]:
     return lines
 
 
+def _tail_suffix(session_key: str, *, n: int = 4) -> str:
+    key = (session_key or "").strip()
+    if not key:
+        return ""
+    tail = key.split(":")[-1].strip()
+    if not tail:
+        return ""
+    if len(tail) <= n:
+        return tail
+    return tail[-n:]
+
+
 def _cell_width(ch: str) -> int:
     if not ch:
         return 0
@@ -810,7 +822,12 @@ class ClawMonitorTUI:
                 return f"run:{parts[5]}"
         # For channel sessions, prefer a human label if configured.
         if info.kind == "channel":
+            raw_tail = self._key_tail(sv.meta.key, agent_id=(sv.meta.agent_id or "-"))
             lbl = session_display_label(self.cfg.labels, sv.meta)
+            if lbl and lbl != raw_tail:
+                # Disambiguate if multiple sessions share the same label.
+                suf = _tail_suffix(sv.meta.key, n=4)
+                return f"{lbl}({suf})" if suf else lbl
             if lbl:
                 return lbl
         return self._key_tail(sv.meta.key, agent_id=(sv.meta.agent_id or "-"))
@@ -1035,9 +1052,9 @@ class ClawMonitorTUI:
             self._safe_addnstr(stdscr, 1, 0, f"Channels: (unavailable) {err or ''}".ljust(width), width)
 
     def _draw_list(self, stdscr: "curses._CursesWindow", y: int, h: int, w: int, items: List[ListItem]) -> None:
-        node_w = max(12, min(24, int(w * 0.24)))
+        node_w = max(10, min(18, int(w * 0.20)))
         state_w = 11
-        flags_w = max(10, min(18, int(w * 0.22)))
+        flags_w = max(8, min(12, int(w * 0.16)))
         header = f"{_fit('NODE', node_w)}  {_fit('STATE', state_w)}  U-AGE  A-AGE  RUN   {_fit('FLAGS', flags_w)}  SESSION"
         self._safe_addnstr(stdscr, y, 0, header.ljust(w), w, curses.A_BOLD)
         body_y = y + 1
@@ -1114,7 +1131,11 @@ class ClawMonitorTUI:
             if sv.telegram_routed_elsewhere:
                 flags.append("BIND")
             flags.extend(_agent_markers(sv.meta, self.model.config_snapshot))
-            flag_str = ",".join(flags)
+            # Keep the list compact so SESSION remains readable.
+            keep = max(1, min(3, len(flags)))
+            shown_flags = flags[:keep]
+            extra = max(0, len(flags) - len(shown_flags))
+            flag_str = ",".join(shown_flags) + (f"+{extra}" if extra else "")
             indent = "  " * max(0, it.indent_units)
             node_text = f"{indent}- {it.node_label}"
             line = (
@@ -1134,7 +1155,7 @@ class ClawMonitorTUI:
 
         log_budget = 0
         if self.show_logs:
-            log_budget = min(10, max(0, h // 3))
+            log_budget = min(18, max(0, h // 3))
         detail_h = max(0, h - (log_budget + (1 if log_budget else 0)))
 
         # Clear details region first.
@@ -1150,7 +1171,8 @@ class ClawMonitorTUI:
 
         if self.show_logs and log_budget:
             log_y = y + detail_h
-            self._safe_addnstr(stdscr, log_y, x, "Related Logs:".ljust(w), w, curses.A_BOLD)
+            hdr_attr = curses.A_BOLD | (self._color_working if self._colors_enabled else 0)
+            self._safe_addnstr(stdscr, log_y, x, "Related Logs:".ljust(w), w, hdr_attr)
             log_y += 1
             for i in range(min(log_budget, len(rel_logs))):
                 self._safe_addnstr(stdscr, log_y + i, x, rel_logs[i][:w].ljust(w), w)
@@ -1593,7 +1615,7 @@ class ClawMonitorTUI:
         opts: List[Tuple[str, str]] = []
         if chan and key:
             tail = key.split(":")[-1].strip()
-            if tail:
+            if tail and (tail.startswith(("ou_", "oc_", "om_")) or (tail.isdigit() and len(tail) >= 5)):
                 opts.append((f"id:{chan}:{tail}", f"id:{chan}:{tail}"))
         if chan and meta.to:
             opts.append((f"target:{chan}:{meta.to}", f"target:{chan}:{meta.to}"))

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Optional
 
 from .session_store import SessionMeta
@@ -15,6 +14,21 @@ def _id_from_key_tail(session_key: str) -> Optional[str]:
         last = parts[-1].strip()
         return last or None
     return None
+
+
+def _looks_like_external_id(channel: Optional[str], tail: str) -> bool:
+    ch = (channel or "").strip()
+    t = (tail or "").strip()
+    if not t:
+        return False
+    if ch == "feishu":
+        return t.startswith(("ou_", "oc_", "om_"))
+    if ch == "telegram":
+        return t.isdigit() and len(t) >= 5
+    # Generic fallback: long opaque-ish ids.
+    if len(t) >= 12 and any(c.isdigit() for c in t) and any(c.isalpha() for c in t):
+        return True
+    return False
 
 
 def session_display_label(label_map: dict[str, str], meta: SessionMeta) -> Optional[str]:
@@ -41,11 +55,18 @@ def session_display_label(label_map: dict[str, str], meta: SessionMeta) -> Optio
 
     if chan and key:
         tail = _id_from_key_tail(key)
-        if tail:
+        if tail and _looks_like_external_id(chan, tail):
             v = label_map.get(f"id:{chan}:{tail}")
             if v:
                 return v
 
-    if meta.origin_label:
-        return meta.origin_label
+    # Only use origin_label as a display name on channels where it is known to
+    # be descriptive (Telegram often includes username + id). For other
+    # channels this field is frequently just an opaque id or an internal label.
+    if meta.origin_label and (meta.channel or "").strip() == "telegram":
+        raw = meta.origin_label.strip()
+        if not raw:
+            return None
+        if any(ch in raw for ch in (" ", "@")):
+            return raw
     return None
