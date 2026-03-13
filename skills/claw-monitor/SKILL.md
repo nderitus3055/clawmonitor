@@ -33,6 +33,14 @@ pip install clawmonitor
 
 ## Core commands
 
+### 0) Tree view (who owns which sessions)
+
+If you suspect ACP/subagent routing issues (e.g. Telegram thread bindings), start with:
+
+```bash
+clawmonitor tree
+```
+
 ### 1) Status (Markdown)
 
 Show the core status table (good default for IM replies):
@@ -55,6 +63,22 @@ Export a redacted report for a single session key:
 clawmonitor report --session-key 'agent:main:main' --format md
 ```
 
+### 2.5) TUI (interactive)
+
+Full-screen monitor UI:
+
+```bash
+clawmonitor tui
+```
+
+Useful keys:
+
+- `t`: toggle tree/flat list
+- `r`: refresh now
+- `f`: cycle refresh interval
+- `Enter`: nudge selected session
+- `?`: help overlay
+
 ### 3) Nudge (ask the session to report progress)
 
 Send a progress request into the session (this is a trigger message; the agent may reply to IM depending on routing/delivery):
@@ -68,4 +92,3 @@ clawmonitor nudge --session-key 'agent:main:main' --template progress
 - Prefer `--format md` outputs for IM replies.
 - If status shows `DELIVERY_FAILED` or `NO_FEEDBACK`, include the relevant sessionKey and recommend a `report` export next.
 - Avoid pasting raw gateway logs unless the user asks; use `clawmonitor report` which redacts common secrets.
-
