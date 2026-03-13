@@ -10,6 +10,7 @@ import re
 import unicodedata
 
 from .actions import TEMPLATES, send_nudge
+from .acpx_sessions import AcpxSnapshot, acpx_is_working, acpx_session_path, load_acpx_snapshot, tail_acpx_messages
 from .channels_status import ChannelsSnapshot, fetch_channels_status
 from .config import Config
 from .delivery_queue import DeliveryFailure, load_failed_delivery_map
@@ -22,7 +23,7 @@ from .redact import redact_text
 from .session_keys import parse_session_key
 from .reports import write_report_files
 from .session_store import SessionMeta, list_sessions
-from .state import SessionComputed, WorkState, compute_state
+from .state import SessionComputed, WorkState, WorkingSignal, compute_state
 from .thread_bindings import TelegramThreadBinding, load_telegram_thread_bindings
 from .transcript_tail import TranscriptTail, tail_transcript
 
@@ -313,6 +314,8 @@ class SessionView:
     meta: SessionMeta
     tail: TranscriptTail
     lock: Optional[LockInfo]
+    working: Optional[WorkingSignal]
+    acpx: Optional[AcpxSnapshot]
     delivery_failure: Optional[DeliveryFailure]
     computed: SessionComputed
     findings: List[Finding]
@@ -328,6 +331,7 @@ class MonitorModel:
         self.elog = elog
         self._sessions: List[SessionView] = []
         self._tail_cache: Dict[Path, Tuple[float, int, TranscriptTail]] = {}
+        self._acpx_cache: Dict[Path, Tuple[float, int, Optional[AcpxSnapshot], TranscriptTail]] = {}
         self._delivery_map: Dict[str, DeliveryFailure] = {}
         self._delivery_last_load = 0.0
         self._gateway_logs = GatewayLogTailer(cfg.openclaw_bin, ring_lines=cfg.gateway_log_ring_lines)
@@ -392,6 +396,22 @@ class MonitorModel:
         except Exception:
             return TranscriptTail(None, None, None, None, None, None, None)
 
+    def _acpx_tail_for(self, acpx_session_id: str) -> Tuple[Optional[AcpxSnapshot], TranscriptTail]:
+        path = acpx_session_path(acpx_session_id)
+        if not path.exists():
+            return None, TranscriptTail(None, None, None, None, None, None, None)
+        try:
+            st = path.stat()
+            cached = self._acpx_cache.get(path)
+            if cached and cached[0] == st.st_mtime and cached[1] == st.st_size:
+                return cached[2], cached[3]
+            snap, doc = load_acpx_snapshot(acpx_session_id)
+            tail = tail_acpx_messages(doc) if doc else TranscriptTail(None, None, None, None, None, None, None)
+            self._acpx_cache[path] = (st.st_mtime, st.st_size, snap, tail)
+            return snap, tail
+        except Exception:
+            return None, TranscriptTail(None, None, None, None, None, None, None)
+
     def _refresh_telegram_bindings(self) -> None:
         # Lightweight local file read; throttle to avoid needless IO.
         now = time.time()
@@ -434,7 +454,10 @@ class MonitorModel:
         for meta in metas:
             if self.cfg.hide_system_sessions and meta.system_sent:
                 continue
+            acpx: Optional[AcpxSnapshot] = None
             tail = self._tail_for(meta.session_file)
+            if (not meta.session_file or not meta.session_file.exists()) and meta.acpx_session_id:
+                acpx, tail = self._acpx_tail_for(meta.acpx_session_id)
             lock = read_lock(lock_path_for_session_file(meta.session_file)) if meta.session_file else None
             df = self._delivery_map.get(meta.key)
             safeguard_ok = True
@@ -444,7 +467,14 @@ class MonitorModel:
                     safeguard_ok = bool(compaction_cfg and compaction_cfg.mode == "safeguard")
             except Exception:
                 safeguard_ok = True
-            computed = compute_state(meta.aborted_last_run, tail, lock, df, safeguard_ok=safeguard_ok)
+            working: Optional[WorkingSignal] = None
+            if lock is None and meta.acp_state in ("running", "pending"):
+                if acpx is None:
+                    working = WorkingSignal(kind="acp", created_at=_dt_from_ms(meta.updated_at_ms), pid=None, pid_alive=None)
+                elif acpx_is_working(acpx):
+                    created_at = acpx.last_prompt_at or acpx.last_used_at or acpx.updated_at or _dt_from_ms(meta.updated_at_ms)
+                    working = WorkingSignal(kind="acp", created_at=created_at, pid=acpx.pid, pid_alive=None)
+            computed = compute_state(meta.aborted_last_run, tail, lock, df, safeguard_ok=safeguard_ok, working=working)
             findings = diagnose(
                 session_key=meta.key,
                 channel=meta.channel,
@@ -466,6 +496,8 @@ class MonitorModel:
                     meta=meta,
                     tail=tail,
                     lock=lock,
+                    working=working,
+                    acpx=acpx,
                     delivery_failure=df,
                     computed=computed,
                     findings=findings,
@@ -544,6 +576,9 @@ class ClawMonitorTUI:
         info = parse_session_key(sv.meta.key)
         if info.kind == "channel":
             return (sv.meta.channel or info.channel or "channel").strip() or "channel"
+        if info.kind == "acp":
+            st = (sv.meta.acp_state or "").strip()
+            return f"acp:{st}" if st else "acp"
         return info.kind
 
     def _build_list_items(self, sessions: List["SessionView"]) -> List[ListItem]:
@@ -725,8 +760,9 @@ class ClawMonitorTUI:
             u_age = _fmt_age(_age_seconds(user_msg.ts if user_msg else sv.updated_at))
             a_age = _fmt_age(_age_seconds(sv.tail.last_assistant.ts if sv.tail.last_assistant else None))
             run = "-"
-            if sv.lock and sv.lock.created_at:
-                run = _fmt_age(int((datetime.now(timezone.utc) - sv.lock.created_at).total_seconds()))
+            run_at = sv.lock.created_at if sv.lock else (sv.working.created_at if sv.working else None)
+            if run_at:
+                run = _fmt_age(int((datetime.now(timezone.utc) - run_at).total_seconds()))
             flags: List[str] = []
             health_cls = _health_class(
                 state=sv.computed.state,
@@ -742,6 +778,8 @@ class ClawMonitorTUI:
                 flags.append("DLV")
             if sv.lock and sv.lock.pid_alive is False:
                 flags.append("ZLOCK")
+            if sv.working and sv.working.kind == "acp":
+                flags.append("ACPRUN")
             if sv.computed.safety_alert:
                 flags.append("SAFE")
             if sv.transcript_missing:
@@ -888,13 +926,25 @@ class ClawMonitorTUI:
         self._safe_addnstr(stdscr, y_status, x, _fit("Status", w), w, status_attr)
         markers = _agent_markers(sv.meta, self.model.config_snapshot)
         mark_str = f" ({','.join(markers)})" if markers else ""
+        key_info = parse_session_key(sv.meta.key)
+        agent_kind = "configured" if (self.model.config_snapshot and self.model.config_snapshot.configured_agent_ids.get(sv.meta.agent_id, False)) else "implicit"
         status_lines: List[str] = [
             f"SessionKey: {sv.meta.key}",
-            f"Agent: {sv.meta.agent_id}{mark_str}  Channel: {sv.meta.channel or '-'}  Account: {sv.meta.account_id or '-'}",
+            f"Agent: {sv.meta.agent_id}{mark_str}  Kind: {key_info.kind}/{agent_kind}  Channel: {sv.meta.channel or '-'}  Account: {sv.meta.account_id or '-'}",
             f"UpdatedAt: {_fmt_dt(sv.updated_at)}",
             f"Transcript: {'MISSING' if sv.transcript_missing else ('-' if not sv.meta.session_file else 'OK')}",
             f"State: {sv.computed.state.value}  Reason: {sv.computed.reason}",
         ]
+        if sv.tail.last_entry_type:
+            status_lines.append(f"LastEntry: {sv.tail.last_entry_type} @ {_fmt_dt(sv.tail.last_entry_ts)}")
+        if sv.acpx and sv.meta.acpx_session_id:
+            st = sv.meta.acp_state or "-"
+            exit_at = _fmt_dt(sv.acpx.last_agent_exit_at)
+            status_lines.append(f"ACPX: id={sv.meta.acpx_session_id} state={st} closed={sv.acpx.closed} exitAt={exit_at}")
+        if sv.working and not sv.lock:
+            status_lines.append(
+                f"Work: {sv.working.kind} pid={sv.working.pid or '-'} since={_fmt_dt(sv.working.created_at)}"
+            )
         # Task summary (best-effort): show what the agent is working on right now.
         if sv.lock:
             task_src = sv.tail.last_user_send
@@ -902,6 +952,18 @@ class ClawMonitorTUI:
                 status_lines.extend(_wrap_lines(f"Task: {redact_text(task_src.preview)}", max(10, w), max_lines=2)[:2])
             elif sv.tail.last_trigger and sv.tail.last_trigger.preview:
                 status_lines.extend(_wrap_lines(f"Trigger: {redact_text(sv.tail.last_trigger.preview)}", max(10, w), max_lines=2)[:2])
+            if sv.tail.last_assistant_thinking:
+                think_lines = _wrap_lines(f"Thinking: {redact_text(sv.tail.last_assistant_thinking)}", max(10, w), max_lines=2)
+                status_lines.extend(think_lines[:2])
+            if sv.tail.last_tool_error:
+                ts, summary = sv.tail.last_tool_error
+                status_lines.append(f"Last tool error: {_fmt_dt(ts)} {redact_text(summary)}")
+            if last_activity:
+                status_lines.extend(_wrap_lines(f"Activity: {redact_text(last_activity)}", max(10, w), max_lines=1)[:1])
+        elif sv.working:
+            task_src = sv.tail.last_user_send or sv.tail.last_trigger
+            if task_src and task_src.preview:
+                status_lines.extend(_wrap_lines(f"Task: {redact_text(task_src.preview)}", max(10, w), max_lines=2)[:2])
             if sv.tail.last_assistant_thinking:
                 think_lines = _wrap_lines(f"Thinking: {redact_text(sv.tail.last_assistant_thinking)}", max(10, w), max_lines=2)
                 status_lines.extend(think_lines[:2])
@@ -976,9 +1038,11 @@ class ClawMonitorTUI:
             user_lines = [f"@ {_fmt_dt(sv.tail.last_user_send.ts)}", ""] + _wrap_lines(redact_text(sv.tail.last_user_send.preview), max(0, col1), max_lines=msg_h - 2)
         claw_lines: List[str] = ["-"]
         if sv.tail.last_assistant:
+            model = sv.tail.last_assistant.model or "-"
+            provider = sv.tail.last_assistant.provider or "-"
             claw_lines = [
                 f"@ {_fmt_dt(sv.tail.last_assistant.ts)}",
-                f"stop={sv.tail.last_assistant.stop_reason or '-'}",
+                f"stop={sv.tail.last_assistant.stop_reason or '-'}  model={provider}/{model}" if (model != "-" or provider != "-") else f"stop={sv.tail.last_assistant.stop_reason or '-'}",
                 "",
             ] + _wrap_lines(redact_text(sv.tail.last_assistant.preview), max(0, col2), max_lines=msg_h - 3)
         trig_lines: List[str] = ["-"]
@@ -1036,19 +1100,44 @@ class ClawMonitorTUI:
         self._safe_addnstr(stdscr, y_status, x, _fit("Status", w), w, status_attr)
         markers = _agent_markers(sv.meta, self.model.config_snapshot)
         mark_str = f" ({','.join(markers)})" if markers else ""
+        key_info = parse_session_key(sv.meta.key)
+        agent_kind = "configured" if (self.model.config_snapshot and self.model.config_snapshot.configured_agent_ids.get(sv.meta.agent_id, False)) else "implicit"
         status_lines: List[str] = [
             f"SessionKey: {sv.meta.key}",
-            f"Agent: {sv.meta.agent_id}{mark_str}  Channel: {sv.meta.channel or '-'}  Account: {sv.meta.account_id or '-'}",
+            f"Agent: {sv.meta.agent_id}{mark_str}  Kind: {key_info.kind}/{agent_kind}  Channel: {sv.meta.channel or '-'}  Account: {sv.meta.account_id or '-'}",
             f"UpdatedAt: {_fmt_dt(sv.updated_at)}",
             f"Transcript: {'MISSING' if sv.transcript_missing else ('-' if not sv.meta.session_file else 'OK')}",
             f"State: {sv.computed.state.value}  Reason: {sv.computed.reason}",
         ]
+        if sv.tail.last_entry_type:
+            status_lines.append(f"LastEntry: {sv.tail.last_entry_type} @ {_fmt_dt(sv.tail.last_entry_ts)}")
+        if sv.acpx and sv.meta.acpx_session_id:
+            st = sv.meta.acp_state or "-"
+            exit_at = _fmt_dt(sv.acpx.last_agent_exit_at)
+            status_lines.append(f"ACPX: id={sv.meta.acpx_session_id} state={st} closed={sv.acpx.closed} exitAt={exit_at}")
+        if sv.working and not sv.lock:
+            status_lines.append(
+                f"Work: {sv.working.kind} pid={sv.working.pid or '-'} since={_fmt_dt(sv.working.created_at)}"
+            )
         if sv.lock:
             task_src = sv.tail.last_user_send
             if task_src and task_src.preview:
                 status_lines.extend(_wrap_lines(f"Task: {redact_text(task_src.preview)}", max(10, w), max_lines=2)[:2])
             elif sv.tail.last_trigger and sv.tail.last_trigger.preview:
                 status_lines.extend(_wrap_lines(f"Trigger: {redact_text(sv.tail.last_trigger.preview)}", max(10, w), max_lines=2)[:2])
+            if sv.tail.last_assistant_thinking:
+                status_lines.extend(
+                    _wrap_lines(f"Thinking: {redact_text(sv.tail.last_assistant_thinking)}", max(10, w), max_lines=2)[:2]
+                )
+            if sv.tail.last_tool_error:
+                ts, summary = sv.tail.last_tool_error
+                status_lines.append(f"Last tool error: {_fmt_dt(ts)} {redact_text(summary)}")
+            if last_activity:
+                status_lines.extend(_wrap_lines(f"Activity: {redact_text(last_activity)}", max(10, w), max_lines=1)[:1])
+        elif sv.working:
+            task_src = sv.tail.last_user_send or sv.tail.last_trigger
+            if task_src and task_src.preview:
+                status_lines.extend(_wrap_lines(f"Task: {redact_text(task_src.preview)}", max(10, w), max_lines=2)[:2])
             if sv.tail.last_assistant_thinking:
                 status_lines.extend(
                     _wrap_lines(f"Thinking: {redact_text(sv.tail.last_assistant_thinking)}", max(10, w), max_lines=2)[:2]
@@ -1095,11 +1184,14 @@ class ClawMonitorTUI:
         # Last Claw Send
         self._safe_addnstr(stdscr, y_claw, x, _fit("Last Claw Send", w), w, claw_attr)
         if sv.tail.last_assistant:
+            model = sv.tail.last_assistant.model or "-"
+            provider = sv.tail.last_assistant.provider or "-"
+            model_str = f"  model={provider}/{model}" if (model != "-" or provider != "-") else ""
             self._safe_addnstr(
                 stdscr,
                 y_claw + 1,
                 x,
-                _fit(f"@ {_fmt_dt(sv.tail.last_assistant.ts)}  stop={sv.tail.last_assistant.stop_reason or '-'}", w),
+                _fit(f"@ {_fmt_dt(sv.tail.last_assistant.ts)}  stop={sv.tail.last_assistant.stop_reason or '-'}{model_str}", w),
                 w,
             )
             msg_lines = _wrap_lines(redact_text(sv.tail.last_assistant.preview), max(0, w), max_lines=max(0, claw_h - 2))
