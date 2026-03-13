@@ -74,6 +74,7 @@ clawmonitor watch --interval 1
 - `↑/↓`：切换选中 session
 - `Enter`：对选中 session 发送 nudge（选择模板）
 - `?`：显示帮助说明
+- `t`：切换树形视图（按 agent 分组）
 - `l`：切换 Related Logs 面板
 - `d`：重新计算诊断（强制刷新）
 - `e`：导出该 session 的脱敏报告（JSON+MD）

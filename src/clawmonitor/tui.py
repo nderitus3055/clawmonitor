@@ -4,7 +4,7 @@ import curses
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 import time
 import re
 import unicodedata
@@ -478,6 +478,24 @@ class MonitorModel:
         self._sessions = views
 
 
+@dataclass(frozen=True)
+class _ListHeader:
+    agent_id: str
+    agent_kind: str  # configured|implicit
+    count: int
+
+
+@dataclass(frozen=True)
+class _ListSession:
+    sv: "SessionView"
+    indent_units: int
+    node_label: str
+    key_tail: str
+
+
+ListItem = Union[_ListHeader, _ListSession]
+
+
 class ClawMonitorTUI:
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
@@ -485,7 +503,9 @@ class ClawMonitorTUI:
         self.model = MonitorModel(cfg, self.elog)
         self.selected = 0
         self.scroll = 0
+        self.selected_session_key: Optional[str] = None
         self.show_logs = True
+        self.tree_view = True
         self.refresh_seconds = float(cfg.ui_seconds)
         self._last_refresh_at: Optional[float] = None
         self._colors_enabled = False
@@ -493,9 +513,132 @@ class ClawMonitorTUI:
         self._color_working = 0
         self._color_idle = 0
         self._color_alert = 0
+        self._color_magenta = 0
 
     def run(self) -> None:
         curses.wrapper(self._main)
+
+    def _agent_kind(self, agent_id: str) -> str:
+        snap = self.model.config_snapshot
+        if snap and snap.configured_agent_ids.get(agent_id):
+            return "configured"
+        return "implicit"
+
+    def _indent_units_for(self, session_key: str) -> int:
+        info = parse_session_key(session_key)
+        if info.kind == "subagent":
+            depth = max(1, info.subagent_depth)
+            return 1 + depth
+        if info.kind == "acp":
+            return 2
+        return 1
+
+    def _key_tail(self, session_key: str, *, agent_id: str) -> str:
+        key = (session_key or "").strip()
+        prefix = f"agent:{agent_id}:"
+        if key.startswith(prefix):
+            return key[len(prefix) :]
+        return key
+
+    def _node_label_for(self, sv: "SessionView") -> str:
+        info = parse_session_key(sv.meta.key)
+        if info.kind == "channel":
+            return (sv.meta.channel or info.channel or "channel").strip() or "channel"
+        return info.kind
+
+    def _build_list_items(self, sessions: List["SessionView"]) -> List[ListItem]:
+        if not self.tree_view:
+            return [
+                _ListSession(sv=sv, indent_units=0, node_label=(sv.meta.agent_id or "-"), key_tail=sv.meta.key)
+                for sv in sessions
+            ]
+
+        by_agent: Dict[Tuple[str, str], List["SessionView"]] = {}
+        for sv in sessions:
+            agent_id = sv.meta.agent_id or "-"
+            agent_kind = self._agent_kind(agent_id)
+            by_agent.setdefault((agent_id, agent_kind), []).append(sv)
+
+        def sess_sort_key(sv: "SessionView") -> Tuple[int, str, str]:
+            info = parse_session_key(sv.meta.key)
+            kind = info.kind
+            order = {
+                "main": 0,
+                "channel": 1,
+                "heartbeat": 2,
+                "acp": 3,
+                "subagent": 4,
+                "unknown": 9,
+            }.get(kind, 9)
+            surface = (sv.meta.channel or info.channel or kind or "-").lower()
+            return (order, surface, sv.meta.key)
+
+        items: List[ListItem] = []
+        for (agent_id, agent_kind) in sorted(by_agent.keys(), key=lambda x: (x[1] != "configured", x[0])):
+            rows = sorted(by_agent[(agent_id, agent_kind)], key=sess_sort_key)
+            items.append(_ListHeader(agent_id=agent_id, agent_kind=agent_kind, count=len(rows)))
+            for sv in rows:
+                items.append(
+                    _ListSession(
+                        sv=sv,
+                        indent_units=self._indent_units_for(sv.meta.key),
+                        node_label=self._node_label_for(sv),
+                        key_tail=self._key_tail(sv.meta.key, agent_id=agent_id),
+                    )
+                )
+        return items
+
+    def _is_selectable(self, item: ListItem) -> bool:
+        return isinstance(item, _ListSession)
+
+    def _selected_session(self, items: List[ListItem]) -> Optional["SessionView"]:
+        if not items or self.selected < 0 or self.selected >= len(items):
+            return None
+        it = items[self.selected]
+        if isinstance(it, _ListSession):
+            return it.sv
+        return None
+
+    def _reconcile_selection(self, items: List[ListItem]) -> None:
+        if not items:
+            self.selected = 0
+            self.scroll = 0
+            self.selected_session_key = None
+            return
+
+        if self.selected_session_key:
+            for i, it in enumerate(items):
+                if isinstance(it, _ListSession) and it.sv.meta.key == self.selected_session_key:
+                    self.selected = i
+                    return
+
+        for i, it in enumerate(items):
+            if self._is_selectable(it):
+                self.selected = i
+                if isinstance(items[i], _ListSession):
+                    self.selected_session_key = items[i].sv.meta.key
+                return
+        self.selected = 0
+        self.selected_session_key = None
+
+    def _move_selection(self, items: List[ListItem], delta: int) -> None:
+        if not items:
+            return
+        i = self.selected
+        step = 1 if delta > 0 else -1
+        remaining = abs(delta)
+        while remaining > 0:
+            j = i + step
+            while 0 <= j < len(items) and not self._is_selectable(items[j]):
+                j += step
+            if j < 0 or j >= len(items):
+                break
+            i = j
+            remaining -= 1
+        self.selected = max(0, min(len(items) - 1, i))
+        sv = self._selected_session(items)
+        if sv:
+            self.selected_session_key = sv.meta.key
 
     def _row_attr(self, health_cls: str, *, selected: bool) -> int:
         attr = curses.A_NORMAL
@@ -526,9 +669,9 @@ class ClawMonitorTUI:
         h, w = stdscr.getmaxyx()
         if y < 0 or y >= h or x < 0 or x >= w:
             return
-        # Keep a 1-col margin to avoid curses wrapping long/wide strings into the
+        # Keep a small margin to avoid curses wrapping long/wide strings into the
         # next line (which can visually "spill" into the left pane).
-        maxw = min(width, max(0, w - x - 1))
+        maxw = min(width, max(0, w - x - 2))
         if maxw <= 0:
             return
         text = _sanitize_for_curses(text)
@@ -553,15 +696,14 @@ class ClawMonitorTUI:
             err = self.model.gateway_log_tailer.last_error
             self._safe_addnstr(stdscr, 1, 0, f"Channels: (unavailable) {err or ''}".ljust(width), width)
 
-    def _draw_list(self, stdscr: "curses._CursesWindow", y: int, h: int, w: int, sessions: List[SessionView]) -> None:
-        agent_w = 10
-        chan_w = 8
+    def _draw_list(self, stdscr: "curses._CursesWindow", y: int, h: int, w: int, items: List[ListItem]) -> None:
+        node_w = max(12, min(24, int(w * 0.24)))
         state_w = 11
-        flags_w = 12
-        header = f"{_fit('AGENT', agent_w)}  {_fit('CHAN', chan_w)}  {_fit('STATE', state_w)}  U-AGE  A-AGE  RUN   {_fit('FLAGS', flags_w)}  SESSION"
+        flags_w = max(10, min(18, int(w * 0.22)))
+        header = f"{_fit('NODE', node_w)}  {_fit('STATE', state_w)}  U-AGE  A-AGE  RUN   {_fit('FLAGS', flags_w)}  SESSION"
         self._safe_addnstr(stdscr, y, 0, header.ljust(w), w, curses.A_BOLD)
         body_y = y + 1
-        visible = h - 1
+        visible = max(0, h - 1)
         if self.selected < self.scroll:
             self.scroll = self.selected
         if self.selected >= self.scroll + visible:
@@ -569,10 +711,16 @@ class ClawMonitorTUI:
         for i in range(visible):
             idx = self.scroll + i
             row_y = body_y + i
-            if idx >= len(sessions):
+            if idx >= len(items):
                 self._safe_addnstr(stdscr, row_y, 0, " ".ljust(w), w)
                 continue
-            sv = sessions[idx]
+            it = items[idx]
+            if isinstance(it, _ListHeader):
+                line = f"{it.agent_id} ({it.agent_kind})  sessions={it.count}"
+                self._safe_addnstr(stdscr, row_y, 0, _fit(line, w).ljust(w), w, curses.A_BOLD)
+                continue
+
+            sv = it.sv
             user_msg = sv.tail.last_user_send
             u_age = _fmt_age(_age_seconds(user_msg.ts if user_msg else sv.updated_at))
             a_age = _fmt_age(_age_seconds(sv.tail.last_assistant.ts if sv.tail.last_assistant else None))
@@ -602,13 +750,14 @@ class ClawMonitorTUI:
                 flags.append("BIND")
             flags.extend(_agent_markers(sv.meta, self.model.config_snapshot))
             flag_str = ",".join(flags)
+            indent = "  " * max(0, it.indent_units)
+            node_text = f"{indent}- {it.node_label}"
             line = (
-                f"{_fit(sv.meta.agent_id, agent_w)}  "
-                f"{_fit((sv.meta.channel or '-'), chan_w)}  "
+                f"{_fit(node_text, node_w)}  "
                 f"{_fit(sv.computed.state.value, state_w)}  "
                 f"{u_age:>5}  {a_age:>5}  {run:>5}  "
                 f"{_fit(flag_str, flags_w)}  "
-                f"{sv.meta.key}"
+                f"{it.key_tail}"
             )
             attr = self._row_attr(health_cls, selected=(idx == self.selected))
             self._safe_addnstr(stdscr, row_y, 0, line.ljust(w), w, attr)
@@ -793,7 +942,11 @@ class ClawMonitorTUI:
             status_lines.append("Diagnosis: (none)")
 
         for i in range(min(status_h - 1, len(status_lines))):
-            self._safe_addnstr(stdscr, y_status + 1 + i, x, _fit(status_lines[i], w), w)
+            ln = status_lines[i]
+            attr = 0
+            if ln.startswith(("Task:", "Thinking:", "Trigger:")):
+                attr = self._color_magenta if self._colors_enabled else 0
+            self._safe_addnstr(stdscr, y_status + 1 + i, x, _fit(ln, w), w, attr)
 
         if msg_h <= 2:
             return
@@ -923,7 +1076,11 @@ class ClawMonitorTUI:
         if sv.findings:
             status_lines.append(f"Diagnosis: [{sv.findings[0].severity}] {sv.findings[0].id}")
         for i in range(min(status_h - 1, len(status_lines))):
-            self._safe_addnstr(stdscr, y_status + 1 + i, x, _fit(status_lines[i], w), w)
+            ln = status_lines[i]
+            attr = 0
+            if ln.startswith(("Task:", "Thinking:", "Trigger:")):
+                attr = self._color_magenta if self._colors_enabled else 0
+            self._safe_addnstr(stdscr, y_status + 1 + i, x, _fit(ln, w), w, attr)
 
         # Last User Send
         self._safe_addnstr(stdscr, y_user, x, _fit("Last User Send", w), w, user_attr)
@@ -1009,10 +1166,15 @@ class ClawMonitorTUI:
             "Actions:",
             "  r              Refresh now",
             "  f              Cycle refresh interval (up to 10 minutes)",
+            "  t              Toggle tree view (group by agent)",
             "  Enter          Send nudge (chat.send) using a template",
             "  e              Export redacted report (JSON+MD)",
             "  l              Toggle related logs panel",
             "  d              Re-run diagnosis (forces refresh)",
+            "",
+            "Left list columns:",
+            "  NODE, STATE, U-AGE, A-AGE, RUN, FLAGS, SESSION",
+            "  (SESSION is the sessionKey tail; may be truncated in narrow terminals)",
             "",
             "Health labels (FLAGS column):",
             "  OK     Normal / completed",
@@ -1094,11 +1256,13 @@ class ClawMonitorTUI:
                 curses.init_pair(2, curses.COLOR_YELLOW, -1)
                 curses.init_pair(3, curses.COLOR_CYAN, -1)
                 curses.init_pair(4, curses.COLOR_RED, -1)
+                curses.init_pair(5, curses.COLOR_MAGENTA, -1)
                 self._colors_enabled = True
                 self._color_ok = curses.color_pair(1)
                 self._color_working = curses.color_pair(3)
                 self._color_idle = curses.color_pair(2)
                 self._color_alert = curses.color_pair(4)
+                self._color_magenta = curses.color_pair(5)
         except Exception:
             self._colors_enabled = False
         stdscr.timeout(200)
@@ -1114,10 +1278,8 @@ class ClawMonitorTUI:
                 dirty = True
 
             sessions = self.model.sessions
-            if sessions and self.selected >= len(sessions):
-                self.selected = len(sessions) - 1
-            if self.selected < 0:
-                self.selected = 0
+            items = self._build_list_items(sessions)
+            self._reconcile_selection(items)
 
             try:
                 ch = stdscr.getch()
@@ -1132,10 +1294,10 @@ class ClawMonitorTUI:
             if ch in (ord("q"), 27):
                 return
             if ch in (curses.KEY_UP, ord("k")):
-                self.selected = max(0, self.selected - 1)
+                self._move_selection(items, -1)
                 dirty = True
             elif ch in (curses.KEY_DOWN, ord("j")):
-                self.selected = min(len(sessions) - 1, self.selected + 1) if sessions else 0
+                self._move_selection(items, 1)
                 dirty = True
             elif ch == ord("r"):
                 self.model.refresh()
@@ -1158,11 +1320,15 @@ class ClawMonitorTUI:
                     i = 2
                 self.refresh_seconds = opts[(i + 1) % len(opts)]
                 dirty = True
+            elif ch == ord("t"):
+                self.tree_view = not self.tree_view
+                self.scroll = 0
+                dirty = True
             elif ch == ord("?"):
                 self._help_overlay(stdscr)
                 dirty = True
             elif ch in (ord("e"), 10, 13):
-                sv = sessions[self.selected] if sessions else None
+                sv = self._selected_session(items)
                 if ch == ord("e") and sv:
                     self._export_report(sv)
                     dirty = True
@@ -1184,6 +1350,10 @@ class ClawMonitorTUI:
             if not dirty:
                 continue
 
+            # Rebuild in case view toggles changed.
+            items = self._build_list_items(self.model.sessions)
+            self._reconcile_selection(items)
+
             stdscr.erase()
             h, w = stdscr.getmaxyx()
             self._draw_header(stdscr, w)
@@ -1191,8 +1361,8 @@ class ClawMonitorTUI:
             list_h = h - 3
             list_w = max(52, min(max(52, int(w * 0.55)), max(0, w - 24)))
             detail_w = w - list_w - 1
-            self._draw_list(stdscr, y=2, h=list_h, w=list_w, sessions=sessions)
-            sv = sessions[self.selected] if sessions else None
+            self._draw_list(stdscr, y=2, h=list_h, w=list_w, items=items)
+            sv = self._selected_session(items)
             if detail_w >= 24 and list_w < w - 1:
                 try:
                     stdscr.vline(2, list_w, curses.ACS_VLINE, max(0, h - 3))
@@ -1211,9 +1381,17 @@ class ClawMonitorTUI:
             refresh_age = "-"
             if self._last_refresh_at is not None:
                 refresh_age = _fmt_age(int(time.time() - self._last_refresh_at))
+            selectable = [it for it in items if isinstance(it, _ListSession)]
+            sel_total = len(selectable)
+            sel_pos = 0
+            if sv and sel_total:
+                try:
+                    sel_pos = 1 + [x.sv.meta.key for x in selectable].index(sv.meta.key)
+                except ValueError:
+                    sel_pos = 0
             footer = (
                 f"[q]quit [?]help [↑↓]select [r]refresh [f]interval={int(self.refresh_seconds)}s "
-                f"[Enter]nudge [e]export [l]logs  sel={self.selected+1}/{len(sessions)} lastRefresh={refresh_age}"
+                f"[t]{'tree' if self.tree_view else 'flat'} [Enter]nudge [e]export [l]logs  sel={sel_pos}/{sel_total} lastRefresh={refresh_age}"
             )
             self._safe_addnstr(stdscr, h - 1, 0, footer.ljust(w), w, curses.A_REVERSE)
 

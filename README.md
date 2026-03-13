@@ -67,6 +67,7 @@ Runtime data (NOT stored in this repo):
 - `↑/↓`: move selection
 - `Enter`: nudge selected session (choose template)
 - `?`: show help overlay
+- `t`: toggle tree view (group by agent)
 - `l`: toggle related logs panel
 - `d`: re-run diagnosis for selected session
 - `e`: export a redacted report for selected session
@@ -75,6 +76,7 @@ Runtime data (NOT stored in this repo):
 - `q`: quit
 
 Rows are color-coded when your terminal supports colors (`OK` green, `RUN` cyan, `IDLE` yellow, `ALERT` red).
+In the details panel, `Task:` / `Thinking:` lines are highlighted (magenta when supported).
 
 ## Telegram note: ACP “thread bindings”
 
