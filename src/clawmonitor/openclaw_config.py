@@ -15,6 +15,20 @@ class CompactionConfig:
 class OpenClawConfigSnapshot:
     compaction_by_agent: Dict[str, CompactionConfig]
     configured_agent_ids: Dict[str, bool]
+    agent_names: Dict[str, str]
+
+    def agent_label(self, agent_id: str) -> str:
+        """
+        User-facing label for an agent.
+
+        If a configured agent has an explicit name (e.g. "jack") that differs
+        from its id (e.g. "agentd"), format as "jack(agentd)".
+        """
+        aid = (agent_id or "").strip() or "-"
+        name = (self.agent_names.get(aid) or "").strip()
+        if name and name != aid:
+            return f"{name}({aid})"
+        return aid
 
 
 def _get(d: Any, *path: str) -> Any:
@@ -42,6 +56,7 @@ def read_openclaw_config_snapshot(openclaw_root: Path) -> OpenClawConfigSnapshot
 
     compaction_by_agent: Dict[str, CompactionConfig] = {}
     configured_agent_ids: Dict[str, bool] = {}
+    agent_names: Dict[str, str] = {}
     agents_list = _get(doc, "agents", "list")
     if isinstance(agents_list, list):
         for ent in agents_list:
@@ -51,6 +66,9 @@ def read_openclaw_config_snapshot(openclaw_root: Path) -> OpenClawConfigSnapshot
             if not isinstance(agent_id, str) or not agent_id:
                 continue
             configured_agent_ids[agent_id] = True
+            nm = ent.get("name") or ent.get("displayName") or ent.get("title")
+            if isinstance(nm, str) and nm.strip():
+                agent_names[agent_id] = nm.strip()
             mode = _get(ent, "compaction", "mode")
             if isinstance(mode, str):
                 compaction_by_agent[agent_id] = CompactionConfig(mode=mode)
@@ -60,4 +78,8 @@ def read_openclaw_config_snapshot(openclaw_root: Path) -> OpenClawConfigSnapshot
         compaction_by_agent["main"] = defaults
         configured_agent_ids["main"] = True
 
-    return OpenClawConfigSnapshot(compaction_by_agent=compaction_by_agent, configured_agent_ids=configured_agent_ids)
+    return OpenClawConfigSnapshot(
+        compaction_by_agent=compaction_by_agent,
+        configured_agent_ids=configured_agent_ids,
+        agent_names=agent_names,
+    )

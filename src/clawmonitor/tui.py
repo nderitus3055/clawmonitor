@@ -62,6 +62,7 @@ from .eventlog import EventLog
 from .gateway_logs import GatewayLogTailer
 from .locks import LockInfo, lock_path_for_session_file, read_lock
 from .openclaw_config import OpenClawConfigSnapshot, read_openclaw_config_snapshot
+from .openclaw_cron import CronSnapshot, match_cron_job, read_cron_snapshot
 from .redact import redact_text
 from .session_keys import parse_session_key
 from .reports import write_report_files
@@ -387,6 +388,8 @@ class MonitorModel:
         self._telegram_bindings_last_load = 0.0
         self._cfg_snapshot: Optional[OpenClawConfigSnapshot] = None
         self._cfg_snapshot_last_load = 0.0
+        self._cron_snapshot: Optional[CronSnapshot] = None
+        self._cron_snapshot_last_load = 0.0
 
     @property
     def gateway_log_tailer(self) -> GatewayLogTailer:
@@ -401,6 +404,11 @@ class MonitorModel:
     def config_snapshot(self) -> Optional[OpenClawConfigSnapshot]:
         with self._sessions_lock:
             return self._cfg_snapshot
+
+    @property
+    def cron_snapshot(self) -> Optional[CronSnapshot]:
+        with self._sessions_lock:
+            return self._cron_snapshot
 
     @property
     def sessions(self) -> List[SessionView]:
@@ -484,6 +492,18 @@ class MonitorModel:
             self._cfg_snapshot = snap
             self._cfg_snapshot_last_load = now
 
+    def _refresh_cron_snapshot(self) -> None:
+        now = time.time()
+        if now - self._cron_snapshot_last_load < 2.0:
+            return
+        try:
+            snap = read_cron_snapshot(self.cfg.openclaw_root)
+        except Exception:
+            snap = None
+        with self._sessions_lock:
+            self._cron_snapshot = snap
+            self._cron_snapshot_last_load = now
+
     def _tail_for_meta(self, meta: SessionMeta, *, lock_present: bool) -> TranscriptTail:
         """
         Avoid re-statting/re-reading JSONL on every refresh by using sessions.json
@@ -520,18 +540,20 @@ class MonitorModel:
             if progress:
                 progress(msg, i, total)
 
-        tick("Loading delivery queue…", 1, 7)
+        tick("Loading delivery queue…", 1, 8)
         self._refresh_delivery_map()
-        tick("Tailing gateway logs…", 2, 7)
+        tick("Tailing gateway logs…", 2, 8)
         self._refresh_gateway_logs()
-        tick("Reading channels status…", 3, 7)
+        tick("Reading channels status…", 3, 8)
         self._refresh_channels()
-        tick("Loading telegram bindings…", 4, 7)
+        tick("Loading telegram bindings…", 4, 8)
         self._refresh_telegram_bindings()
-        tick("Reading openclaw.json…", 5, 7)
+        tick("Reading openclaw.json…", 5, 8)
         self._refresh_config_snapshot()
+        tick("Reading cron jobs…", 6, 8)
+        self._refresh_cron_snapshot()
 
-        tick("Listing sessions…", 6, 7)
+        tick("Listing sessions…", 7, 8)
         metas = list_sessions(self.cfg.openclaw_root)
         views: List[SessionView] = []
         total = max(1, len(metas))
@@ -539,7 +561,7 @@ class MonitorModel:
             if self.cfg.hide_system_sessions and meta.system_sent:
                 continue
             if progress and (idx % 12 == 0):
-                tick(f"Tailing transcripts… ({idx+1}/{total})", 7, 7)
+                tick(f"Tailing transcripts… ({idx+1}/{total})", 8, 8)
             lock = read_lock(lock_path_for_session_file(meta.session_file)) if meta.session_file else None
             acpx: Optional[AcpxSnapshot] = None
             tail = self._tail_for_meta(meta, lock_present=bool(lock))
@@ -702,12 +724,20 @@ class ClawMonitorTUI:
             return "configured"
         return "implicit"
 
+    def _agent_label(self, agent_id: str) -> str:
+        snap = self.model.config_snapshot
+        if snap:
+            return snap.agent_label(agent_id)
+        return (agent_id or "").strip() or "-"
+
     def _indent_units_for(self, session_key: str) -> int:
         info = parse_session_key(session_key)
         if info.kind == "subagent":
             depth = max(1, info.subagent_depth)
             return 1 + depth
         if info.kind == "acp":
+            return 2
+        if info.kind == "cron_run":
             return 2
         return 1
 
@@ -722,15 +752,41 @@ class ClawMonitorTUI:
         info = parse_session_key(sv.meta.key)
         if info.kind == "channel":
             return (sv.meta.channel or info.channel or "channel").strip() or "channel"
+        if info.kind == "cron":
+            job = match_cron_job(self.model.cron_snapshot, sv.meta.key)
+            if job and job.name:
+                return "cron"
+            return "cron"
+        if info.kind == "cron_run":
+            return "run"
         if info.kind == "acp":
             st = (sv.meta.acp_state or "").strip()
             return f"acp:{st}" if st else "acp"
         return info.kind
 
+    def _display_key_tail(self, sv: "SessionView") -> str:
+        info = parse_session_key(sv.meta.key)
+        if info.kind == "cron":
+            job = match_cron_job(self.model.cron_snapshot, sv.meta.key)
+            if job and job.name:
+                return job.name
+        if info.kind == "cron_run":
+            # Prefer showing just the run id suffix if present.
+            key = (sv.meta.key or "").strip()
+            parts = key.split(":")
+            if len(parts) >= 6 and parts[0] == "agent" and parts[2] == "cron" and parts[4] == "run":
+                return f"run:{parts[5]}"
+        return self._key_tail(sv.meta.key, agent_id=(sv.meta.agent_id or "-"))
+
     def _build_list_items(self, sessions: List["SessionView"]) -> List[ListItem]:
         if not self.tree_view:
             return [
-                _ListSession(sv=sv, indent_units=0, node_label=(sv.meta.agent_id or "-"), key_tail=sv.meta.key)
+                _ListSession(
+                    sv=sv,
+                    indent_units=0,
+                    node_label=self._agent_label(sv.meta.agent_id or "-"),
+                    key_tail=sv.meta.key,
+                )
                 for sv in sessions
             ]
 
@@ -747,8 +803,10 @@ class ClawMonitorTUI:
                 "main": 0,
                 "channel": 1,
                 "heartbeat": 2,
-                "acp": 3,
-                "subagent": 4,
+                "cron": 3,
+                "cron_run": 4,
+                "acp": 5,
+                "subagent": 6,
                 "unknown": 9,
             }.get(kind, 9)
             surface = (sv.meta.channel or info.channel or kind or "-").lower()
@@ -764,7 +822,7 @@ class ClawMonitorTUI:
                         sv=sv,
                         indent_units=self._indent_units_for(sv.meta.key),
                         node_label=self._node_label_for(sv),
-                        key_tail=self._key_tail(sv.meta.key, agent_id=agent_id),
+                        key_tail=self._display_key_tail(sv),
                     )
                 )
         return items
@@ -946,7 +1004,7 @@ class ClawMonitorTUI:
                 continue
             it = items[idx]
             if isinstance(it, _ListHeader):
-                line = f"{it.agent_id} ({it.agent_kind})  sessions={it.count}"
+                line = f"{self._agent_label(it.agent_id)} ({it.agent_kind})  sessions={it.count}"
                 self._safe_addnstr(stdscr, row_y, 0, _fit(line, w).ljust(w), w, curses.A_BOLD)
                 continue
 
@@ -1030,7 +1088,15 @@ class ClawMonitorTUI:
         lines.append(f"SessionKey: {sv.meta.key}")
         markers = _agent_markers(sv.meta, self.model.config_snapshot)
         mark_str = f" ({','.join(markers)})" if markers else ""
-        lines.append(f"Agent: {sv.meta.agent_id}{mark_str}  Channel: {sv.meta.channel or '-'}  Account: {sv.meta.account_id or '-'}")
+        lines.append(
+            f"Agent: {self._agent_label(sv.meta.agent_id)}{mark_str}  Channel: {sv.meta.channel or '-'}  Account: {sv.meta.account_id or '-'}"
+        )
+        cron_job = match_cron_job(self.model.cron_snapshot, sv.meta.key)
+        if cron_job:
+            label = cron_job.name or cron_job.id
+            enabled = "-" if cron_job.enabled is None else ("enabled" if cron_job.enabled else "disabled")
+            owner = cron_job.agent_id or "-"
+            lines.append(f"Cron: {label}  jobId={cron_job.id[:8]}  agent={owner}  {enabled}")
         if sv.meta.kind or sv.meta.chat_type:
             lines.append(f"Kind: {sv.meta.kind or '-'}  ChatType: {sv.meta.chat_type or '-'}")
         lines.append(f"UpdatedAt: {_fmt_dt(sv.updated_at)}")
@@ -1118,11 +1184,17 @@ class ClawMonitorTUI:
         agent_kind = "configured" if (self.model.config_snapshot and self.model.config_snapshot.configured_agent_ids.get(sv.meta.agent_id, False)) else "implicit"
         status_lines: List[str] = [
             f"SessionKey: {sv.meta.key}",
-            f"Agent: {sv.meta.agent_id}{mark_str}  Kind: {key_info.kind}/{agent_kind}  Channel: {sv.meta.channel or '-'}  Account: {sv.meta.account_id or '-'}",
+            f"Agent: {self._agent_label(sv.meta.agent_id)}{mark_str}  Kind: {key_info.kind}/{agent_kind}  Channel: {sv.meta.channel or '-'}  Account: {sv.meta.account_id or '-'}",
             f"UpdatedAt: {_fmt_dt(sv.updated_at)}",
             f"Transcript: {'MISSING' if sv.transcript_missing else ('-' if not sv.meta.session_file else 'OK')}",
             f"State: {sv.computed.state.value}  Reason: {sv.computed.reason}",
         ]
+        cron_job = match_cron_job(self.model.cron_snapshot, sv.meta.key)
+        if cron_job:
+            label = cron_job.name or cron_job.id
+            enabled = "-" if cron_job.enabled is None else ("enabled" if cron_job.enabled else "disabled")
+            owner = cron_job.agent_id or "-"
+            status_lines.insert(2, f"Cron: {label}  jobId={cron_job.id[:8]}  agent={owner}  {enabled}")
         if sv.tail.last_entry_type:
             status_lines.append(f"LastEntry: {sv.tail.last_entry_type} @ {_fmt_dt(sv.tail.last_entry_ts)}")
         if sv.acpx and sv.meta.acpx_session_id:
@@ -1292,11 +1364,17 @@ class ClawMonitorTUI:
         agent_kind = "configured" if (self.model.config_snapshot and self.model.config_snapshot.configured_agent_ids.get(sv.meta.agent_id, False)) else "implicit"
         status_lines: List[str] = [
             f"SessionKey: {sv.meta.key}",
-            f"Agent: {sv.meta.agent_id}{mark_str}  Kind: {key_info.kind}/{agent_kind}  Channel: {sv.meta.channel or '-'}  Account: {sv.meta.account_id or '-'}",
+            f"Agent: {self._agent_label(sv.meta.agent_id)}{mark_str}  Kind: {key_info.kind}/{agent_kind}  Channel: {sv.meta.channel or '-'}  Account: {sv.meta.account_id or '-'}",
             f"UpdatedAt: {_fmt_dt(sv.updated_at)}",
             f"Transcript: {'MISSING' if sv.transcript_missing else ('-' if not sv.meta.session_file else 'OK')}",
             f"State: {sv.computed.state.value}  Reason: {sv.computed.reason}",
         ]
+        cron_job = match_cron_job(self.model.cron_snapshot, sv.meta.key)
+        if cron_job:
+            label = cron_job.name or cron_job.id
+            enabled = "-" if cron_job.enabled is None else ("enabled" if cron_job.enabled else "disabled")
+            owner = cron_job.agent_id or "-"
+            status_lines.insert(2, f"Cron: {label}  jobId={cron_job.id[:8]}  agent={owner}  {enabled}")
         if sv.tail.last_entry_type:
             status_lines.append(f"LastEntry: {sv.tail.last_entry_type} @ {_fmt_dt(sv.tail.last_entry_ts)}")
         if sv.acpx and sv.meta.acpx_session_id:
