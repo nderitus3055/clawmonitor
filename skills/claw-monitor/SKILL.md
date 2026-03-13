@@ -25,11 +25,45 @@ Use this skill when the user asks questions like:
 - This skill runs on a machine that has OpenClaw state at `~/.openclaw/`.
 - `clawmonitor` is installed on that same machine.
 
+## Preflight (recommended)
+
+Before using the commands below, verify the binary exists and can read local OpenClaw state:
+
+```bash
+clawmonitor --version
+clawmonitor init --non-interactive || true
+clawmonitor status --format md
+```
+
+If `clawmonitor` is missing, or `status` fails, install it first.
+
 Install:
 
 ```bash
 pip install clawmonitor
 ```
+
+Alternative installs (cleaner / safer):
+
+- `pipx` (recommended when available):
+
+  ```bash
+  pipx install clawmonitor
+  ```
+
+- Virtualenv:
+
+  ```bash
+  python3 -m venv .venv
+  . .venv/bin/activate
+  pip install -U pip
+  pip install clawmonitor
+  ```
+
+Notes:
+
+- Some OpenClaw environments intentionally disallow installing packages at runtime. If installs are blocked, ask the user to install `clawmonitor` on the host first.
+- `clawmonitor init` writes config under `~/.config/clawmonitor/config.toml` and is safe to re-run.
 
 ## Core commands
 
@@ -86,6 +120,17 @@ Send a progress request into the session (this is a trigger message; the agent m
 ```bash
 clawmonitor nudge --session-key 'agent:main:main' --template progress
 ```
+
+## Troubleshooting quick wins
+
+- If `clawmonitor status` shows `DELIVERY_FAILED`: export a report and check the redacted error + related logs.
+
+  ```bash
+  clawmonitor report --session-key 'agent:main:main' --format md
+  ```
+
+- If Telegram looks “bound” to the wrong sessionKey (ACP routing): run `clawmonitor tree`, then monitor the bound session instead of `agent:main:...`.
+- If TUI is unavailable (non-interactive terminals): use `clawmonitor status --format md --detail` for a stable IM-friendly view.
 
 ## Reply guidelines
 
