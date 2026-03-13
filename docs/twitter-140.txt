@@ -1,0 +1,1 @@
+ClawMonitor v0.1.4: tree-view OpenClaw sessions (agent groups + ACP/subagent indent) and highlighted Task/Thinking in TUI. #OpenClaw
