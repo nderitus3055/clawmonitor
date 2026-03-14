@@ -2,7 +2,7 @@
 
 ## 0.1.7
 
-- TUI: fix occasional “stale characters” artifacts on dynamic lines by padding redraws (prevents leftover fragments like `ounter(line`).
+- TUI: fix occasional “stale characters” artifacts on dynamic lines by padding redraws (prevents leftover fragments on screen).
 
 ## 0.1.6
 
