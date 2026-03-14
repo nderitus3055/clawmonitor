@@ -64,7 +64,7 @@ from .config import write_labels
 from .locks import LockInfo, lock_path_for_session_file, read_lock
 from .openclaw_config import OpenClawConfigSnapshot, read_openclaw_config_snapshot
 from .openclaw_cron import CronJob, CronRunStatus, CronSnapshot, match_cron_job, read_cron_last_runs, read_cron_snapshot
-from .labels import session_display_label
+from .labels import has_user_label, session_display_label
 from .redact import redact_text
 from .session_keys import parse_session_key
 from .reports import write_report_files
@@ -686,6 +686,8 @@ class ClawMonitorTUI:
         self.tree_view = True
         self.show_cron = True
         self.node_show_session_label = False
+        self.focus_mode = False
+        self.focus_recent_hours = 24.0
         self.refresh_seconds = float(cfg.ui_seconds)
         self._last_refresh_at: Optional[float] = None
         self._colors_enabled = False
@@ -706,6 +708,8 @@ class ClawMonitorTUI:
         self._rel_cache_log_count: int = -1
         self._rel_cache_lines: List[str] = []
         self._rel_cache_last_activity: Optional[str] = None
+        self._last_total_sessions = 0
+        self._last_shown_sessions = 0
 
     def run(self) -> None:
         curses.wrapper(self._main)
@@ -894,6 +898,48 @@ class ClawMonitorTUI:
                 for job in jobs:
                     items.append(_ListCronJob(agent_id=agent_id, job=job, last_run=runs.get(job.id)))
         return items
+
+    def _is_focus_interesting(self, sv: SessionView) -> bool:
+        # Always keep any session that is working or needs attention.
+        if sv.computed.state.value in ("WORKING", "INTERRUPTED"):
+            return True
+        if sv.computed.no_feedback:
+            return True
+        if sv.delivery_failure is not None:
+            return True
+        if sv.computed.safety_alert or sv.computed.safeguard_alert:
+            return True
+        if sv.transcript_missing:
+            return True
+        if sv.lock and sv.lock.pid_alive is False:
+            return True
+        if sv.telegram_routed_elsewhere:
+            return True
+        if sv.working and sv.working.kind == "acp":
+            return True
+        # Keep sessions explicitly labeled by the user.
+        if has_user_label(self.cfg.labels, sv.meta):
+            return True
+        # Keep recently active sessions.
+        latest = sv.updated_at
+        if sv.tail.last_user_send and sv.tail.last_user_send.ts and (latest is None or sv.tail.last_user_send.ts > latest):
+            latest = sv.tail.last_user_send.ts
+        if sv.tail.last_assistant and sv.tail.last_assistant.ts and (latest is None or sv.tail.last_assistant.ts > latest):
+            latest = sv.tail.last_assistant.ts
+        if latest:
+            age = _age_seconds(latest)
+            if age is not None and age <= int(self.focus_recent_hours * 3600):
+                return True
+        return False
+
+    def _apply_session_filter(self, sessions: List[SessionView]) -> List[SessionView]:
+        self._last_total_sessions = len(sessions)
+        if not self.focus_mode:
+            self._last_shown_sessions = len(sessions)
+            return sessions
+        out = [sv for sv in sessions if self._is_focus_interesting(sv)]
+        self._last_shown_sessions = len(out)
+        return out
 
     def _is_selectable(self, item: ListItem) -> bool:
         return isinstance(item, _ListSession)
@@ -1751,6 +1797,7 @@ class ClawMonitorTUI:
             "  t              Toggle tree view (group by agent)",
             "  c              Toggle cron jobs in tree view",
             "  n              Toggle NODE label mode (channel:label)",
+            "  x              Toggle Focus filter (hide stale/boring sessions)",
             "  Enter          Send nudge (chat.send) using a template",
             "  e              Export redacted report (JSON+MD)",
             "  l              Toggle related logs panel",
@@ -1788,6 +1835,7 @@ class ClawMonitorTUI:
             "",
             "Notes:",
             "  - Related Logs require Gateway logs.tail (online mode).",
+            "  - Focus filter keeps WORKING/ALERT/recent/labeled sessions; press [x] to see all.",
             "  - Reports/logs are redacted, but review before sharing.",
             "",
             "Press any key to close.",
@@ -1888,7 +1936,8 @@ class ClawMonitorTUI:
                     self._request_refresh()
                     dirty = True
 
-            sessions = self.model.sessions
+            sessions_all = self.model.sessions
+            sessions = self._apply_session_filter(sessions_all)
             items = self._build_list_items(sessions)
             self._reconcile_selection(items)
 
@@ -1942,6 +1991,10 @@ class ClawMonitorTUI:
             elif ch == ord("n"):
                 self.node_show_session_label = not self.node_show_session_label
                 dirty = True
+            elif ch == ord("x"):
+                self.focus_mode = not self.focus_mode
+                self.scroll = 0
+                dirty = True
             elif ch == ord("R"):
                 sv = self._selected_session(items)
                 if sv:
@@ -1974,7 +2027,9 @@ class ClawMonitorTUI:
                 continue
 
             # Rebuild in case view toggles changed.
-            items = self._build_list_items(self.model.sessions)
+            sessions_all = self.model.sessions
+            sessions = self._apply_session_filter(sessions_all)
+            items = self._build_list_items(sessions)
             self._reconcile_selection(items)
 
             stdscr.erase()
@@ -2031,8 +2086,10 @@ class ClawMonitorTUI:
             footer = (
                 f"[q]quit [?]help [↑↓]select [r]refresh [f]interval={int(self.refresh_seconds)}s "
                 f"[t]{'tree' if self.tree_view else 'flat'} [c]{'cron' if self.show_cron else 'nocron'} "
+                f"[x]{'focus' if self.focus_mode else 'all'} "
                 f"[n]{'node:label' if self.node_show_session_label else 'node:plain'} "
-                f"[R]rename [Enter]nudge [e]export [l]logs  sel={sel_pos}/{sel_total} lastRefresh={refresh_age}{refresh_note}"
+                f"[R]rename [Enter]nudge [e]export [l]logs  sel={sel_pos}/{sel_total} "
+                f"sessions={self._last_shown_sessions}/{self._last_total_sessions} lastRefresh={refresh_age}{refresh_note}"
             )
             self._safe_addnstr(stdscr, h - 1, 0, footer.ljust(w), w, curses.A_REVERSE)
 

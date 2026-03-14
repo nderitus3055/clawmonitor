@@ -70,3 +70,22 @@ def session_display_label(label_map: dict[str, str], meta: SessionMeta) -> Optio
         if any(ch in raw for ch in (" ", "@")):
             return raw
     return None
+
+
+def has_user_label(label_map: dict[str, str], meta: SessionMeta) -> bool:
+    """
+    True if the user configured a label that could match this session.
+
+    This ignores channel-provided origin labels.
+    """
+    key = (meta.key or "").strip()
+    if key and f"sessionKey:{key}" in label_map:
+        return True
+    chan = (meta.channel or "").strip() or None
+    if chan and meta.to and f"target:{chan}:{meta.to}" in label_map:
+        return True
+    if chan and key:
+        tail = _id_from_key_tail(key)
+        if tail and _looks_like_external_id(chan, tail) and f"id:{chan}:{tail}" in label_map:
+            return True
+    return False
