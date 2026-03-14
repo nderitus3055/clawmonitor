@@ -13,6 +13,8 @@ def _indent_for(row: StatusRow) -> int:
         return 1 + depth
     if row.session_kind == "acp":
         return 2
+    if row.session_kind == "cron_run":
+        return 2
     return 1
 
 
@@ -27,8 +29,10 @@ def format_tree(rows: List[StatusRow], *, include_task: bool = True) -> str:
 
     lines: List[str] = []
     for (agent_id, agent_kind) in sorted(by_agent.keys(), key=lambda x: (x[1] != "configured", x[0])):
-        lines.append(f"{agent_id} ({agent_kind})")
+        # Prefer the user-facing agent label if available.
         agent_rows = by_agent[(agent_id, agent_kind)]
+        label = agent_rows[0].agent_label if agent_rows and getattr(agent_rows[0], "agent_label", None) else agent_id
+        lines.append(f"{label} ({agent_kind})")
         for r in agent_rows:
             indent = "  " * _indent_for(r)
             flags = ",".join(r.flags) if r.flags else "-"

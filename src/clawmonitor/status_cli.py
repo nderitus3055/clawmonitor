@@ -10,6 +10,7 @@ from .channels_status import fetch_channels_status
 from .delivery_queue import DeliveryFailure, load_failed_delivery_map
 from .locks import LockInfo, lock_path_for_session_file, read_lock
 from .openclaw_config import read_openclaw_config_snapshot
+from .openclaw_cron import match_cron_job, read_cron_snapshot
 from .redact import redact_text
 from .session_keys import parse_session_key
 from .session_tail import tail_for_meta
@@ -59,9 +60,11 @@ def _fmt_age(age: Optional[int]) -> str:
 @dataclass(frozen=True)
 class StatusRow:
     agent_id: str
+    agent_label: str
     channel: Optional[str]
     account_id: Optional[str]
     key: str
+    session_label: str
     session_kind: str
     agent_kind: str
     state: str
@@ -91,10 +94,12 @@ def collect_status(
     transcript_tail_bytes: int,
     hide_system_sessions: bool,
     include_gateway_channels: bool = True,
+    label_map: Optional[Dict[str, str]] = None,
 ) -> List[StatusRow]:
     metas = list_sessions(openclaw_root)
     delivery_map = load_failed_delivery_map(openclaw_root)
     cfg_snapshot = read_openclaw_config_snapshot(openclaw_root)
+    cron_snapshot = read_cron_snapshot(openclaw_root)
     channels = fetch_channels_status(openclaw_bin) if include_gateway_channels else None
     telegram_bindings = load_telegram_thread_bindings(openclaw_root, account_id="default")
 
@@ -128,6 +133,10 @@ def collect_status(
             flags.append("ACP")
         elif key_info.kind == "heartbeat":
             flags.append("HEARTBEAT")
+        elif key_info.kind == "cron":
+            flags.append("CRON")
+        elif key_info.kind == "cron_run":
+            flags.append("CRON_RUN")
         if working and working.kind == "acp":
             flags.append("ACP_RUNNING")
 
@@ -169,12 +178,35 @@ def collect_status(
             src = tail.last_user_send or tail.last_trigger
             task_preview = redact_text(src.preview) if src and src.preview else "-"
 
+        agent_label = cfg_snapshot.agent_label(meta.agent_id)
+        cron_job = match_cron_job(cron_snapshot, meta.key)
+        session_label = meta.key
+        if label_map:
+            try:
+                from .labels import session_display_label
+
+                lbl = session_display_label(label_map, meta)
+                if lbl:
+                    session_label = lbl
+            except Exception:
+                pass
+        if cron_job:
+            base = cron_job.name or cron_job.id
+            if key_info.kind == "cron_run":
+                parts = (meta.key or "").split(":")
+                run_id = parts[5] if len(parts) >= 6 and parts[4] == "run" else ""
+                session_label = f"cron:{base}:run:{run_id}".rstrip(":")
+            else:
+                session_label = f"cron:{base}"
+
         rows.append(
             StatusRow(
                 agent_id=meta.agent_id,
+                agent_label=agent_label,
                 channel=meta.channel,
                 account_id=meta.account_id,
                 key=meta.key,
+                session_label=session_label,
                 session_kind=session_kind,
                 agent_kind=agent_kind,
                 state=computed.state.value,
@@ -211,7 +243,7 @@ def format_table(rows: List[StatusRow], limit: Optional[int] = None, *, detail: 
             return s[:width]
         return (s[: width - 1] + "…")[:width]
 
-    agent_w = max(5, min(16, max((len(r.agent_id or "") for r in shown), default=5)))
+    agent_w = max(5, min(20, max((len(r.agent_label or r.agent_id or "") for r in shown), default=5)))
     if detail:
         header = f"{fit('AGENT', agent_w)}  KIND      STATE        RUN   FLAGS                TASK"
     else:
@@ -224,9 +256,12 @@ def format_table(rows: List[StatusRow], limit: Optional[int] = None, *, detail: 
         flags = ",".join(flags_list)[:20]
         if detail:
             kind = f"{r.session_kind}/{r.agent_kind}"
-            line = f"{fit(r.agent_id, agent_w)}  {fit(kind, 8)}  {r.state:<11}  {r.run_for:>4}  {flags:<20}  {fit(r.task_preview, 60)}"
+            agent_txt = r.agent_label or r.agent_id
+            line = f"{fit(agent_txt, agent_w)}  {fit(kind, 8)}  {r.state:<11}  {r.run_for:>4}  {flags:<20}  {fit(r.task_preview, 60)}"
         else:
-            line = f"{fit(r.agent_id, agent_w)}  {(r.channel or '-')[:8]:<8}  {r.state:<11}  {r.updated_age:>4}  {r.user_age:>4}  {r.assistant_age:>4}  {r.run_for:>4}  {flags:<20}  {r.key}"
+            agent_txt = r.agent_label or r.agent_id
+            sess_txt = r.session_label or r.key
+            line = f"{fit(agent_txt, agent_w)}  {(r.channel or '-')[:8]:<8}  {r.state:<11}  {r.updated_age:>4}  {r.user_age:>4}  {r.assistant_age:>4}  {r.run_for:>4}  {flags:<20}  {sess_txt}"
         lines.append(line)
     return "\n".join(lines)
 
@@ -306,6 +341,7 @@ def watch_loop(
     hide_system_sessions: bool,
     interval_seconds: float,
     limit: Optional[int],
+    label_map: Optional[Dict[str, str]] = None,
 ) -> None:
     try:
         import os
@@ -317,6 +353,7 @@ def watch_loop(
                 transcript_tail_bytes=transcript_tail_bytes,
                 hide_system_sessions=hide_system_sessions,
                 include_gateway_channels=True,
+                label_map=label_map,
             )
             os.system("clear")
             print(format_table(rows, limit=limit))

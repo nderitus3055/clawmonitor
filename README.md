@@ -47,6 +47,7 @@ clawmonitor status --detail
 clawmonitor status --format json
 clawmonitor status --format md
 clawmonitor status --format md --detail
+clawmonitor cron
 clawmonitor tree
 clawmonitor report --session-key 'agent:main:main' --format both
 clawmonitor watch --interval 1
@@ -60,6 +61,11 @@ Default config path:
 
 Example config is in `config.example.toml`.
 
+### Optional labels
+
+You can assign human-friendly names to long session keys (e.g. Feishu `ou_...`).
+See the `[labels]` section in `config.example.toml`.
+
 Runtime data (NOT stored in this repo):
 
 - Logs: `~/.local/state/clawmonitor/events.jsonl`
@@ -71,7 +77,11 @@ Runtime data (NOT stored in this repo):
 - `↑/↓`: move selection
 - `Enter`: nudge selected session (choose template)
 - `?`: show help overlay
+- `x`: focus filter (hide stale sessions)
 - `t`: toggle tree view (group by agent)
+- `c`: toggle cron jobs in tree view
+- `R`: rename/label selected session (writes `[labels]` in config)
+- `n`: toggle NODE label mode (channel:label)
 - `l`: toggle related logs panel
 - `d`: re-run diagnosis for selected session
 - `e`: export a redacted report for selected session

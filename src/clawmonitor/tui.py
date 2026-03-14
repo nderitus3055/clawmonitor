@@ -60,8 +60,11 @@ from .delivery_queue import DeliveryFailure, load_failed_delivery_map
 from .diagnostics import Finding, diagnose, related_logs
 from .eventlog import EventLog
 from .gateway_logs import GatewayLogTailer
+from .config import write_labels
 from .locks import LockInfo, lock_path_for_session_file, read_lock
 from .openclaw_config import OpenClawConfigSnapshot, read_openclaw_config_snapshot
+from .openclaw_cron import CronJob, CronRunStatus, CronSnapshot, match_cron_job, read_cron_last_runs, read_cron_snapshot
+from .labels import has_user_label, session_display_label
 from .redact import redact_text
 from .session_keys import parse_session_key
 from .reports import write_report_files
@@ -183,6 +186,18 @@ def _wrap_lines(text: str, width: int, max_lines: int) -> List[str]:
             last = _truncate_cells(last, width)
         lines[-1] = last
     return lines
+
+
+def _tail_suffix(session_key: str, *, n: int = 4) -> str:
+    key = (session_key or "").strip()
+    if not key:
+        return ""
+    tail = key.split(":")[-1].strip()
+    if not tail:
+        return ""
+    if len(tail) <= n:
+        return tail
+    return tail[-n:]
 
 
 def _cell_width(ch: str) -> int:
@@ -387,6 +402,10 @@ class MonitorModel:
         self._telegram_bindings_last_load = 0.0
         self._cfg_snapshot: Optional[OpenClawConfigSnapshot] = None
         self._cfg_snapshot_last_load = 0.0
+        self._cron_snapshot: Optional[CronSnapshot] = None
+        self._cron_snapshot_last_load = 0.0
+        self._cron_last_runs: Dict[str, CronRunStatus] = {}
+        self._cron_last_runs_last_load = 0.0
 
     @property
     def gateway_log_tailer(self) -> GatewayLogTailer:
@@ -401,6 +420,16 @@ class MonitorModel:
     def config_snapshot(self) -> Optional[OpenClawConfigSnapshot]:
         with self._sessions_lock:
             return self._cfg_snapshot
+
+    @property
+    def cron_snapshot(self) -> Optional[CronSnapshot]:
+        with self._sessions_lock:
+            return self._cron_snapshot
+
+    @property
+    def cron_last_runs(self) -> Dict[str, CronRunStatus]:
+        with self._sessions_lock:
+            return dict(self._cron_last_runs)
 
     @property
     def sessions(self) -> List[SessionView]:
@@ -484,6 +513,30 @@ class MonitorModel:
             self._cfg_snapshot = snap
             self._cfg_snapshot_last_load = now
 
+    def _refresh_cron_snapshot(self) -> None:
+        now = time.time()
+        if now - self._cron_snapshot_last_load < 2.0:
+            return
+        try:
+            snap = read_cron_snapshot(self.cfg.openclaw_root)
+        except Exception:
+            snap = None
+        with self._sessions_lock:
+            self._cron_snapshot = snap
+            self._cron_snapshot_last_load = now
+
+    def _refresh_cron_last_runs(self) -> None:
+        now = time.time()
+        if now - self._cron_last_runs_last_load < 2.0:
+            return
+        try:
+            runs = read_cron_last_runs(self.cfg.openclaw_root)
+        except Exception:
+            runs = {}
+        with self._sessions_lock:
+            self._cron_last_runs = runs
+            self._cron_last_runs_last_load = now
+
     def _tail_for_meta(self, meta: SessionMeta, *, lock_present: bool) -> TranscriptTail:
         """
         Avoid re-statting/re-reading JSONL on every refresh by using sessions.json
@@ -520,18 +573,21 @@ class MonitorModel:
             if progress:
                 progress(msg, i, total)
 
-        tick("Loading delivery queue…", 1, 7)
+        tick("Loading delivery queue…", 1, 8)
         self._refresh_delivery_map()
-        tick("Tailing gateway logs…", 2, 7)
+        tick("Tailing gateway logs…", 2, 8)
         self._refresh_gateway_logs()
-        tick("Reading channels status…", 3, 7)
+        tick("Reading channels status…", 3, 8)
         self._refresh_channels()
-        tick("Loading telegram bindings…", 4, 7)
+        tick("Loading telegram bindings…", 4, 8)
         self._refresh_telegram_bindings()
-        tick("Reading openclaw.json…", 5, 7)
+        tick("Reading openclaw.json…", 5, 8)
         self._refresh_config_snapshot()
+        tick("Reading cron jobs…", 6, 8)
+        self._refresh_cron_snapshot()
+        self._refresh_cron_last_runs()
 
-        tick("Listing sessions…", 6, 7)
+        tick("Listing sessions…", 7, 8)
         metas = list_sessions(self.cfg.openclaw_root)
         views: List[SessionView] = []
         total = max(1, len(metas))
@@ -539,7 +595,7 @@ class MonitorModel:
             if self.cfg.hide_system_sessions and meta.system_sent:
                 continue
             if progress and (idx % 12 == 0):
-                tick(f"Tailing transcripts… ({idx+1}/{total})", 7, 7)
+                tick(f"Tailing transcripts… ({idx+1}/{total})", 8, 8)
             lock = read_lock(lock_path_for_session_file(meta.session_file)) if meta.session_file else None
             acpx: Optional[AcpxSnapshot] = None
             tail = self._tail_for_meta(meta, lock_present=bool(lock))
@@ -595,6 +651,7 @@ class _ListHeader:
     agent_id: str
     agent_kind: str  # configured|implicit
     count: int
+    cron_count: int
 
 
 @dataclass(frozen=True)
@@ -605,12 +662,20 @@ class _ListSession:
     key_tail: str
 
 
-ListItem = Union[_ListHeader, _ListSession]
+@dataclass(frozen=True)
+class _ListCronJob:
+    agent_id: str
+    job: CronJob
+    last_run: Optional[CronRunStatus]
+
+
+ListItem = Union[_ListHeader, _ListSession, _ListCronJob]
 
 
 class ClawMonitorTUI:
-    def __init__(self, cfg: Config) -> None:
+    def __init__(self, cfg: Config, *, config_path: Optional[Path] = None) -> None:
         self.cfg = cfg
+        self.config_path = config_path
         self.elog = EventLog()
         self.model = MonitorModel(cfg, self.elog)
         self._loading_art_lines = _load_loading_art_lines()
@@ -619,6 +684,10 @@ class ClawMonitorTUI:
         self.selected_session_key: Optional[str] = None
         self.show_logs = True
         self.tree_view = True
+        self.show_cron = True
+        self.node_show_session_label = False
+        self.focus_mode = False
+        self.focus_recent_hours = 24.0
         self.refresh_seconds = float(cfg.ui_seconds)
         self._last_refresh_at: Optional[float] = None
         self._colors_enabled = False
@@ -639,6 +708,8 @@ class ClawMonitorTUI:
         self._rel_cache_log_count: int = -1
         self._rel_cache_lines: List[str] = []
         self._rel_cache_last_activity: Optional[str] = None
+        self._last_total_sessions = 0
+        self._last_shown_sessions = 0
 
     def run(self) -> None:
         curses.wrapper(self._main)
@@ -702,12 +773,20 @@ class ClawMonitorTUI:
             return "configured"
         return "implicit"
 
+    def _agent_label(self, agent_id: str) -> str:
+        snap = self.model.config_snapshot
+        if snap:
+            return snap.agent_label(agent_id)
+        return (agent_id or "").strip() or "-"
+
     def _indent_units_for(self, session_key: str) -> int:
         info = parse_session_key(session_key)
         if info.kind == "subagent":
             depth = max(1, info.subagent_depth)
             return 1 + depth
         if info.kind == "acp":
+            return 2
+        if info.kind == "cron_run":
             return 2
         return 1
 
@@ -722,15 +801,51 @@ class ClawMonitorTUI:
         info = parse_session_key(sv.meta.key)
         if info.kind == "channel":
             return (sv.meta.channel or info.channel or "channel").strip() or "channel"
+        if info.kind == "cron":
+            job = match_cron_job(self.model.cron_snapshot, sv.meta.key)
+            if job and job.name:
+                return "cron"
+            return "cron"
+        if info.kind == "cron_run":
+            return "run"
         if info.kind == "acp":
             st = (sv.meta.acp_state or "").strip()
             return f"acp:{st}" if st else "acp"
         return info.kind
 
+    def _display_key_tail(self, sv: "SessionView") -> str:
+        info = parse_session_key(sv.meta.key)
+        if info.kind == "cron":
+            job = match_cron_job(self.model.cron_snapshot, sv.meta.key)
+            if job and job.name:
+                return job.name
+        if info.kind == "cron_run":
+            # Prefer showing just the run id suffix if present.
+            key = (sv.meta.key or "").strip()
+            parts = key.split(":")
+            if len(parts) >= 6 and parts[0] == "agent" and parts[2] == "cron" and parts[4] == "run":
+                return f"run:{parts[5]}"
+        # For channel sessions, prefer a human label if configured.
+        if info.kind == "channel":
+            raw_tail = self._key_tail(sv.meta.key, agent_id=(sv.meta.agent_id or "-"))
+            lbl = session_display_label(self.cfg.labels, sv.meta)
+            if lbl and lbl != raw_tail:
+                # Disambiguate if multiple sessions share the same label.
+                suf = _tail_suffix(sv.meta.key, n=4)
+                return f"{lbl}({suf})" if suf else lbl
+            if lbl:
+                return lbl
+        return self._key_tail(sv.meta.key, agent_id=(sv.meta.agent_id or "-"))
+
     def _build_list_items(self, sessions: List["SessionView"]) -> List[ListItem]:
         if not self.tree_view:
             return [
-                _ListSession(sv=sv, indent_units=0, node_label=(sv.meta.agent_id or "-"), key_tail=sv.meta.key)
+                _ListSession(
+                    sv=sv,
+                    indent_units=0,
+                    node_label=self._agent_label(sv.meta.agent_id or "-"),
+                    key_tail=sv.meta.key,
+                )
                 for sv in sessions
             ]
 
@@ -740,6 +855,13 @@ class ClawMonitorTUI:
             agent_kind = self._agent_kind(agent_id)
             by_agent.setdefault((agent_id, agent_kind), []).append(sv)
 
+        cron_by_agent: Dict[str, List[CronJob]] = {}
+        snap = self.model.cron_snapshot
+        if snap:
+            for job in snap.jobs_by_id.values():
+                aid = (job.agent_id or "main").strip() if job.agent_id else "main"
+                cron_by_agent.setdefault(aid, []).append(job)
+
         def sess_sort_key(sv: "SessionView") -> Tuple[int, str, str]:
             info = parse_session_key(sv.meta.key)
             kind = info.kind
@@ -747,8 +869,10 @@ class ClawMonitorTUI:
                 "main": 0,
                 "channel": 1,
                 "heartbeat": 2,
-                "acp": 3,
-                "subagent": 4,
+                "cron": 3,
+                "cron_run": 4,
+                "acp": 5,
+                "subagent": 6,
                 "unknown": 9,
             }.get(kind, 9)
             surface = (sv.meta.channel or info.channel or kind or "-").lower()
@@ -757,17 +881,65 @@ class ClawMonitorTUI:
         items: List[ListItem] = []
         for (agent_id, agent_kind) in sorted(by_agent.keys(), key=lambda x: (x[1] != "configured", x[0])):
             rows = sorted(by_agent[(agent_id, agent_kind)], key=sess_sort_key)
-            items.append(_ListHeader(agent_id=agent_id, agent_kind=agent_kind, count=len(rows)))
+            cron_count = len(cron_by_agent.get(agent_id, []))
+            items.append(_ListHeader(agent_id=agent_id, agent_kind=agent_kind, count=len(rows), cron_count=cron_count))
             for sv in rows:
                 items.append(
                     _ListSession(
                         sv=sv,
                         indent_units=self._indent_units_for(sv.meta.key),
                         node_label=self._node_label_for(sv),
-                        key_tail=self._key_tail(sv.meta.key, agent_id=agent_id),
+                        key_tail=self._display_key_tail(sv),
                     )
                 )
+            if self.show_cron and cron_count:
+                jobs = sorted(cron_by_agent.get(agent_id, []), key=lambda j: (j.enabled is False, (j.name or ""), j.id))
+                runs = self.model.cron_last_runs
+                for job in jobs:
+                    items.append(_ListCronJob(agent_id=agent_id, job=job, last_run=runs.get(job.id)))
         return items
+
+    def _is_focus_interesting(self, sv: SessionView) -> bool:
+        # Always keep any session that is working or needs attention.
+        if sv.computed.state.value in ("WORKING", "INTERRUPTED"):
+            return True
+        if sv.computed.no_feedback:
+            return True
+        if sv.delivery_failure is not None:
+            return True
+        if sv.computed.safety_alert or sv.computed.safeguard_alert:
+            return True
+        if sv.transcript_missing:
+            return True
+        if sv.lock and sv.lock.pid_alive is False:
+            return True
+        if sv.telegram_routed_elsewhere:
+            return True
+        if sv.working and sv.working.kind == "acp":
+            return True
+        # Keep sessions explicitly labeled by the user.
+        if has_user_label(self.cfg.labels, sv.meta):
+            return True
+        # Keep recently active sessions.
+        latest = sv.updated_at
+        if sv.tail.last_user_send and sv.tail.last_user_send.ts and (latest is None or sv.tail.last_user_send.ts > latest):
+            latest = sv.tail.last_user_send.ts
+        if sv.tail.last_assistant and sv.tail.last_assistant.ts and (latest is None or sv.tail.last_assistant.ts > latest):
+            latest = sv.tail.last_assistant.ts
+        if latest:
+            age = _age_seconds(latest)
+            if age is not None and age <= int(self.focus_recent_hours * 3600):
+                return True
+        return False
+
+    def _apply_session_filter(self, sessions: List[SessionView]) -> List[SessionView]:
+        self._last_total_sessions = len(sessions)
+        if not self.focus_mode:
+            self._last_shown_sessions = len(sessions)
+            return sessions
+        out = [sv for sv in sessions if self._is_focus_interesting(sv)]
+        self._last_shown_sessions = len(out)
+        return out
 
     def _is_selectable(self, item: ListItem) -> bool:
         return isinstance(item, _ListSession)
@@ -927,9 +1099,9 @@ class ClawMonitorTUI:
             self._safe_addnstr(stdscr, 1, 0, f"Channels: (unavailable) {err or ''}".ljust(width), width)
 
     def _draw_list(self, stdscr: "curses._CursesWindow", y: int, h: int, w: int, items: List[ListItem]) -> None:
-        node_w = max(12, min(24, int(w * 0.24)))
+        node_w = max(10, min(18, int(w * 0.20)))
         state_w = 11
-        flags_w = max(10, min(18, int(w * 0.22)))
+        flags_w = max(8, min(12, int(w * 0.16)))
         header = f"{_fit('NODE', node_w)}  {_fit('STATE', state_w)}  U-AGE  A-AGE  RUN   {_fit('FLAGS', flags_w)}  SESSION"
         self._safe_addnstr(stdscr, y, 0, header.ljust(w), w, curses.A_BOLD)
         body_y = y + 1
@@ -946,8 +1118,32 @@ class ClawMonitorTUI:
                 continue
             it = items[idx]
             if isinstance(it, _ListHeader):
-                line = f"{it.agent_id} ({it.agent_kind})  sessions={it.count}"
+                extra = f"  cron={it.cron_count}" if it.cron_count else ""
+                line = f"{self._agent_label(it.agent_id)} ({it.agent_kind})  sessions={it.count}{extra}"
                 self._safe_addnstr(stdscr, row_y, 0, _fit(line, w).ljust(w), w, curses.A_BOLD)
+                continue
+            if isinstance(it, _ListCronJob):
+                job = it.job
+                indent = "  " * 1
+                node_text = f"{indent}- cron"
+                status = (it.last_run.status or "-") if it.last_run else "-"
+                status = status.upper()[:11]
+                run_dt = _dt_from_ms(it.last_run.ts_ms) if it.last_run else None
+                run_age = _fmt_age(_age_seconds(run_dt))
+                flags_list: List[str] = ["CRONJOB"]
+                if job.enabled is False:
+                    flags_list.append("DISABLED")
+                flags = ",".join(flags_list)
+                name = job.name or job.id
+                sess = f"{name} ({job.id[:8]})"
+                line = (
+                    f"{_fit(node_text, node_w)}  "
+                    f"{_fit(status, state_w)}  "
+                    f"{'-':>5}  {'-':>5}  {run_age:>5}  "
+                    f"{_fit(flags, flags_w)}  "
+                    f"{sess}"
+                )
+                self._safe_addnstr(stdscr, row_y, 0, _fit(line, w).ljust(w), w)
                 continue
 
             sv = it.sv
@@ -982,9 +1178,23 @@ class ClawMonitorTUI:
             if sv.telegram_routed_elsewhere:
                 flags.append("BIND")
             flags.extend(_agent_markers(sv.meta, self.model.config_snapshot))
-            flag_str = ",".join(flags)
+            # Keep the list compact so SESSION remains readable.
+            keep = max(1, min(3, len(flags)))
+            shown_flags = flags[:keep]
+            extra = max(0, len(flags) - len(shown_flags))
+            flag_str = ",".join(shown_flags) + (f"+{extra}" if extra else "")
             indent = "  " * max(0, it.indent_units)
-            node_text = f"{indent}- {it.node_label}"
+            node_leaf = it.node_label
+            if self.node_show_session_label:
+                info = parse_session_key(sv.meta.key)
+                if info.kind == "channel":
+                    lbl = session_display_label(self.cfg.labels, sv.meta)
+                    if lbl:
+                        suf = _tail_suffix(sv.meta.key, n=4)
+                        # Keep NODE readable even with repeated labels across old sessions.
+                        lbl2 = f"{lbl}({suf})" if suf else lbl
+                        node_leaf = f"{it.node_label}:{lbl2}"
+            node_text = f"{indent}- {node_leaf}"
             line = (
                 f"{_fit(node_text, node_w)}  "
                 f"{_fit(sv.computed.state.value, state_w)}  "
@@ -1002,7 +1212,7 @@ class ClawMonitorTUI:
 
         log_budget = 0
         if self.show_logs:
-            log_budget = min(10, max(0, h // 3))
+            log_budget = min(18, max(0, h // 3))
         detail_h = max(0, h - (log_budget + (1 if log_budget else 0)))
 
         # Clear details region first.
@@ -1018,7 +1228,8 @@ class ClawMonitorTUI:
 
         if self.show_logs and log_budget:
             log_y = y + detail_h
-            self._safe_addnstr(stdscr, log_y, x, "Related Logs:".ljust(w), w, curses.A_BOLD)
+            hdr_attr = curses.A_BOLD | (self._color_working if self._colors_enabled else 0)
+            self._safe_addnstr(stdscr, log_y, x, "Related Logs:".ljust(w), w, hdr_attr)
             log_y += 1
             for i in range(min(log_budget, len(rel_logs))):
                 self._safe_addnstr(stdscr, log_y + i, x, rel_logs[i][:w].ljust(w), w)
@@ -1030,7 +1241,15 @@ class ClawMonitorTUI:
         lines.append(f"SessionKey: {sv.meta.key}")
         markers = _agent_markers(sv.meta, self.model.config_snapshot)
         mark_str = f" ({','.join(markers)})" if markers else ""
-        lines.append(f"Agent: {sv.meta.agent_id}{mark_str}  Channel: {sv.meta.channel or '-'}  Account: {sv.meta.account_id or '-'}")
+        lines.append(
+            f"Agent: {self._agent_label(sv.meta.agent_id)}{mark_str}  Channel: {sv.meta.channel or '-'}  Account: {sv.meta.account_id or '-'}"
+        )
+        cron_job = match_cron_job(self.model.cron_snapshot, sv.meta.key)
+        if cron_job:
+            label = cron_job.name or cron_job.id
+            enabled = "-" if cron_job.enabled is None else ("enabled" if cron_job.enabled else "disabled")
+            owner = cron_job.agent_id or "-"
+            lines.append(f"Cron: {label}  jobId={cron_job.id[:8]}  agent={owner}  {enabled}")
         if sv.meta.kind or sv.meta.chat_type:
             lines.append(f"Kind: {sv.meta.kind or '-'}  ChatType: {sv.meta.chat_type or '-'}")
         lines.append(f"UpdatedAt: {_fmt_dt(sv.updated_at)}")
@@ -1118,11 +1337,17 @@ class ClawMonitorTUI:
         agent_kind = "configured" if (self.model.config_snapshot and self.model.config_snapshot.configured_agent_ids.get(sv.meta.agent_id, False)) else "implicit"
         status_lines: List[str] = [
             f"SessionKey: {sv.meta.key}",
-            f"Agent: {sv.meta.agent_id}{mark_str}  Kind: {key_info.kind}/{agent_kind}  Channel: {sv.meta.channel or '-'}  Account: {sv.meta.account_id or '-'}",
+            f"Agent: {self._agent_label(sv.meta.agent_id)}{mark_str}  Kind: {key_info.kind}/{agent_kind}  Channel: {sv.meta.channel or '-'}  Account: {sv.meta.account_id or '-'}",
             f"UpdatedAt: {_fmt_dt(sv.updated_at)}",
             f"Transcript: {'MISSING' if sv.transcript_missing else ('-' if not sv.meta.session_file else 'OK')}",
             f"State: {sv.computed.state.value}  Reason: {sv.computed.reason}",
         ]
+        cron_job = match_cron_job(self.model.cron_snapshot, sv.meta.key)
+        if cron_job:
+            label = cron_job.name or cron_job.id
+            enabled = "-" if cron_job.enabled is None else ("enabled" if cron_job.enabled else "disabled")
+            owner = cron_job.agent_id or "-"
+            status_lines.insert(2, f"Cron: {label}  jobId={cron_job.id[:8]}  agent={owner}  {enabled}")
         if sv.tail.last_entry_type:
             status_lines.append(f"LastEntry: {sv.tail.last_entry_type} @ {_fmt_dt(sv.tail.last_entry_ts)}")
         if sv.acpx and sv.meta.acpx_session_id:
@@ -1292,11 +1517,17 @@ class ClawMonitorTUI:
         agent_kind = "configured" if (self.model.config_snapshot and self.model.config_snapshot.configured_agent_ids.get(sv.meta.agent_id, False)) else "implicit"
         status_lines: List[str] = [
             f"SessionKey: {sv.meta.key}",
-            f"Agent: {sv.meta.agent_id}{mark_str}  Kind: {key_info.kind}/{agent_kind}  Channel: {sv.meta.channel or '-'}  Account: {sv.meta.account_id or '-'}",
+            f"Agent: {self._agent_label(sv.meta.agent_id)}{mark_str}  Kind: {key_info.kind}/{agent_kind}  Channel: {sv.meta.channel or '-'}  Account: {sv.meta.account_id or '-'}",
             f"UpdatedAt: {_fmt_dt(sv.updated_at)}",
             f"Transcript: {'MISSING' if sv.transcript_missing else ('-' if not sv.meta.session_file else 'OK')}",
             f"State: {sv.computed.state.value}  Reason: {sv.computed.reason}",
         ]
+        cron_job = match_cron_job(self.model.cron_snapshot, sv.meta.key)
+        if cron_job:
+            label = cron_job.name or cron_job.id
+            enabled = "-" if cron_job.enabled is None else ("enabled" if cron_job.enabled else "disabled")
+            owner = cron_job.agent_id or "-"
+            status_lines.insert(2, f"Cron: {label}  jobId={cron_job.id[:8]}  agent={owner}  {enabled}")
         if sv.tail.last_entry_type:
             status_lines.append(f"LastEntry: {sv.tail.last_entry_type} @ {_fmt_dt(sv.tail.last_entry_ts)}")
         if sv.acpx and sv.meta.acpx_session_id:
@@ -1435,6 +1666,122 @@ class ClawMonitorTUI:
             elif ch in (10, 13):
                 return items[idx]
 
+    def _pick_label_key(self, stdscr: "curses._CursesWindow", meta: SessionMeta) -> Optional[str]:
+        key = (meta.key or "").strip()
+        chan = (meta.channel or "").strip()
+        opts: List[Tuple[str, str]] = []
+        if chan and key:
+            tail = key.split(":")[-1].strip()
+            if tail and (tail.startswith(("ou_", "oc_", "om_")) or (tail.isdigit() and len(tail) >= 5)):
+                opts.append((f"id:{chan}:{tail}", f"id:{chan}:{tail}"))
+        if chan and meta.to:
+            opts.append((f"target:{chan}:{meta.to}", f"target:{chan}:{meta.to}"))
+        if key:
+            opts.append((f"sessionKey:{key}", f"sessionKey:{key}"))
+        if not opts:
+            return None
+
+        idx = 0
+        scroll = 0
+        h, w = stdscr.getmaxyx()
+        win_h = min(10, h - 4)
+        win_w = min(96, max(50, w - 4))
+        win_y = (h - win_h) // 2
+        win_x = (w - win_w) // 2
+        win = curses.newwin(win_h, win_w, win_y, win_x)
+        win.keypad(True)
+        while True:
+            win.clear()
+            win.border()
+            self._safe_addnstr(win, 0, 2, " Choose label key ", win_w - 4)
+            visible = max(1, win_h - 2)
+            if idx < scroll:
+                scroll = idx
+            if idx >= scroll + visible:
+                scroll = idx - visible + 1
+            view = opts[scroll : scroll + visible]
+            for i, (label, _) in enumerate(view):
+                real_idx = scroll + i
+                attr = curses.A_REVERSE if real_idx == idx else curses.A_NORMAL
+                self._safe_addnstr(win, 1 + i, 2, _pad_right_cells(label, win_w - 4), win_w - 4, attr)
+            win.refresh()
+            ch = win.getch()
+            if ch in (27, ord("q")):
+                return None
+            if ch in (curses.KEY_UP, ord("k")):
+                idx = max(0, idx - 1)
+            elif ch in (curses.KEY_DOWN, ord("j")):
+                idx = min(len(opts) - 1, idx + 1)
+            elif ch in (10, 13):
+                return opts[idx][1]
+
+    def _prompt_label(self, stdscr: "curses._CursesWindow", *, title: str, current: str) -> Optional[str]:
+        h, w = stdscr.getmaxyx()
+        win_h = 9
+        win_w = min(96, max(50, w - 4))
+        win_y = (h - win_h) // 2
+        win_x = (w - win_w) // 2
+        win = curses.newwin(win_h, win_w, win_y, win_x)
+        win.keypad(True)
+        win.clear()
+        win.border()
+        self._safe_addnstr(win, 0, 2, f" {title} ", win_w - 4)
+        self._safe_addnstr(win, 1, 2, "Current:", win_w - 4)
+        self._safe_addnstr(win, 2, 4, _fit(current or "-", win_w - 6), win_w - 6)
+        self._safe_addnstr(win, 4, 2, "New label (empty = clear, Esc = cancel):", win_w - 4)
+        win.refresh()
+
+        # Input line
+        try:
+            curses.curs_set(1)
+        except Exception:
+            pass
+        win.move(5, 2)
+        win.clrtoeol()
+        win.refresh()
+        curses.echo()
+        try:
+            raw = win.getstr(5, 2, max(1, win_w - 4))
+        except KeyboardInterrupt:
+            raw = None
+        except Exception:
+            raw = None
+        finally:
+            curses.noecho()
+            try:
+                curses.curs_set(0)
+            except Exception:
+                pass
+        if raw is None:
+            return None
+        try:
+            s = raw.decode("utf-8", errors="ignore")
+        except Exception:
+            s = str(raw)
+        return s.strip()
+
+    def _rename_selected(self, stdscr: "curses._CursesWindow", sv: SessionView) -> None:
+        meta = sv.meta
+        key = self._pick_label_key(stdscr, meta)
+        if not key:
+            return
+        current = self.cfg.labels.get(key) or ""
+        new_label = self._prompt_label(stdscr, title="Set session label", current=current)
+        if new_label is None:
+            return
+        if not new_label:
+            if key in self.cfg.labels:
+                self.cfg.labels.pop(key, None)
+                self.elog.write("labels.cleared", key=key)
+        else:
+            self.cfg.labels[key] = new_label
+            self.elog.write("labels.set", key=key, label=new_label)
+        if self.config_path:
+            try:
+                write_labels(self.config_path, self.cfg.labels)
+            except Exception as e:
+                self.elog.write("labels.write_failed", key=key, error=str(e))
+
     def _help_overlay(self, stdscr: "curses._CursesWindow") -> None:
         lines = [
             "ClawMonitor TUI Help",
@@ -1445,12 +1792,22 @@ class ClawMonitorTUI:
             "",
             "Actions:",
             "  r              Refresh now",
+            "  R              Rename/label selected session",
             "  f              Cycle refresh interval (up to 10 minutes)",
             "  t              Toggle tree view (group by agent)",
+            "  c              Toggle cron jobs in tree view",
+            "  n              Toggle NODE label mode (channel:label)",
+            "  x              Toggle Focus filter (hide stale/boring sessions)",
             "  Enter          Send nudge (chat.send) using a template",
             "  e              Export redacted report (JSON+MD)",
             "  l              Toggle related logs panel",
             "  d              Re-run diagnosis (forces refresh)",
+            "",
+            "States (STATE column):",
+            "  WORKING        Task is running (lock present or ACPX indicates running).",
+            "  FINISHED       No lock and assistant is not behind user.",
+            "  INTERRUPTED    AbortedLastRun + pending reply (usually a crash/kill).",
+            "  NO_MESSAGE     No real inbound user message detected for this session key.",
             "",
             "Performance:",
             "  - Refresh runs asynchronously; footer shows refresh progress/errors.",
@@ -1460,14 +1817,25 @@ class ClawMonitorTUI:
             "  NODE, STATE, U-AGE, A-AGE, RUN, FLAGS, SESSION",
             "  (SESSION is the sessionKey tail; may be truncated in narrow terminals)",
             "",
-            "Health labels (FLAGS column):",
-            "  OK     Normal / completed",
-            "  RUN    Working (lock present)",
-            "  IDLE   No user message seen",
-            "  ALERT  Abnormal (NOFB / delivery failure / safety / safeguard off / interrupted)",
+            "FLAGS column (compact):",
+            "  First token is a health label:",
+            "    OK     Normal / completed",
+            "    RUN    Working / long-running",
+            "    IDLE   No inbound user message (often channel not bound / wrong session key)",
+            "    ALERT  Needs attention (NOFB / delivery failure / safety / safeguard off / interrupted)",
+            "  Then short flags (may show +N for hidden extras):",
+            "    NOFB   User spoke after last assistant reply (pending response).",
+            "    DLV    Delivery queue has failed outbound message(s).",
+            "    ZLOCK  Lock pid is dead but lock file remains (stale lock).",
+            "    ACPRUN ACP/ACPX run appears to be in progress.",
+            "    SAFE   Provider stop_reason suggests a safety/refusal event.",
+            "    TRXM   Transcript missing (sessionFile path missing).",
+            "    BIND   Telegram thread-binding routes this chat elsewhere.",
+            "    ACP/SUB/CODEX/IMPL/HEARTBEAT identify ACP/subagent/codex/implicit/heartbeat sessions.",
             "",
             "Notes:",
             "  - Related Logs require Gateway logs.tail (online mode).",
+            "  - Focus filter keeps WORKING/ALERT/recent/labeled sessions; press [x] to see all.",
             "  - Reports/logs are redacted, but review before sharing.",
             "",
             "Press any key to close.",
@@ -1568,7 +1936,8 @@ class ClawMonitorTUI:
                     self._request_refresh()
                     dirty = True
 
-            sessions = self.model.sessions
+            sessions_all = self.model.sessions
+            sessions = self._apply_session_filter(sessions_all)
             items = self._build_list_items(sessions)
             self._reconcile_selection(items)
 
@@ -1615,6 +1984,22 @@ class ClawMonitorTUI:
                 self.tree_view = not self.tree_view
                 self.scroll = 0
                 dirty = True
+            elif ch == ord("c"):
+                self.show_cron = not self.show_cron
+                self.scroll = 0
+                dirty = True
+            elif ch == ord("n"):
+                self.node_show_session_label = not self.node_show_session_label
+                dirty = True
+            elif ch == ord("x"):
+                self.focus_mode = not self.focus_mode
+                self.scroll = 0
+                dirty = True
+            elif ch == ord("R"):
+                sv = self._selected_session(items)
+                if sv:
+                    self._rename_selected(stdscr, sv)
+                dirty = True
             elif ch == ord("?"):
                 self._help_overlay(stdscr)
                 dirty = True
@@ -1642,7 +2027,9 @@ class ClawMonitorTUI:
                 continue
 
             # Rebuild in case view toggles changed.
-            items = self._build_list_items(self.model.sessions)
+            sessions_all = self.model.sessions
+            sessions = self._apply_session_filter(sessions_all)
+            items = self._build_list_items(sessions)
             self._reconcile_selection(items)
 
             stdscr.erase()
@@ -1698,7 +2085,11 @@ class ClawMonitorTUI:
                 refresh_note = f" refreshErr={err[:40]}"
             footer = (
                 f"[q]quit [?]help [↑↓]select [r]refresh [f]interval={int(self.refresh_seconds)}s "
-                f"[t]{'tree' if self.tree_view else 'flat'} [Enter]nudge [e]export [l]logs  sel={sel_pos}/{sel_total} lastRefresh={refresh_age}{refresh_note}"
+                f"[t]{'tree' if self.tree_view else 'flat'} [c]{'cron' if self.show_cron else 'nocron'} "
+                f"[x]{'focus' if self.focus_mode else 'all'} "
+                f"[n]{'node:label' if self.node_show_session_label else 'node:plain'} "
+                f"[R]rename [Enter]nudge [e]export [l]logs  sel={sel_pos}/{sel_total} "
+                f"sessions={self._last_shown_sessions}/{self._last_total_sessions} lastRefresh={refresh_age}{refresh_note}"
             )
             self._safe_addnstr(stdscr, h - 1, 0, footer.ljust(w), w, curses.A_REVERSE)
 
