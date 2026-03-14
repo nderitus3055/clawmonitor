@@ -1473,11 +1473,31 @@ class ClawMonitorTUI:
         else:
             status_lines.append("Diagnosis: (none)")
 
-        for i in range(min(status_h - 1, len(status_lines))):
-            ln = status_lines[i]
+        max_status_lines = max(0, status_h - 1)
+        visible_status_lines = status_lines
+        if max_status_lines and len(status_lines) > max_status_lines:
+            # Keep the most important "header" lines, but always keep tail lines
+            # where alerts/diagnosis live (including Diagnosis: (none)).
+            head_n = min(5, max(1, max_status_lines - 3))
+            tail_n = max(1, max_status_lines - head_n - 1)
+            visible_status_lines = status_lines[:head_n] + ["…"] + status_lines[-tail_n:]
+
+        for i in range(min(max_status_lines, len(visible_status_lines))):
+            ln = visible_status_lines[i]
             attr = 0
             if ln.startswith(("Task:", "Thinking:", "Trigger:")):
                 attr = self._color_magenta if self._colors_enabled else 0
+            elif ln.startswith("Diagnosis:"):
+                if not self._colors_enabled:
+                    attr = curses.A_BOLD
+                else:
+                    low = ln.lower()
+                    if "(none)" in low:
+                        attr = curses.A_BOLD | self._color_ok
+                    elif "[info]" in low:
+                        attr = curses.A_BOLD | self._color_idle
+                    else:
+                        attr = curses.A_BOLD | self._color_alert
             self._safe_addnstr(stdscr, y_status + 1 + i, x, _fit(ln, w), w, attr)
 
         if msg_h <= 2:
