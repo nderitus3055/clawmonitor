@@ -11,6 +11,8 @@ Per session, ClawMonitor tracks:
 - **abortedLastRun**: from `sessions.json`
 - **delivery failure**: from `delivery-queue/failed` entries keyed by `mirror.sessionKey`
 - **channel IO** (optional): `channels.status` lastInboundAt/lastOutboundAt for the channel account (Gateway online)
+- **cron job (optional)**: if the session key matches `agent:<agentId>:cron:<jobId>...`, ClawMonitor can map it to a job name via `~/.openclaw/cron/jobs.json`
+- **identity name (optional)**: agent display name from workspace `IDENTITY.md` (shown as `name(agentId)`)
 
 ## Primary states
 
@@ -28,3 +30,14 @@ Per session, ClawMonitor tracks:
 - `SAFEGUARD_OFF`: agent compaction mode is not `safeguard` (best-effort snapshot from `openclaw.json`)
 - `TRXM`: transcript missing (sessionFile exists but referenced `*.jsonl` is missing)
 - `BOUND_OTHER` / `BIND`: Telegram chat is routed to another session key via thread bindings
+
+## UI-only features
+
+These do not change the underlying state computation, but help when you have dozens of sessions:
+
+- **Focus filter** (TUI key `x`): hides stale sessions and keeps “interesting” ones:
+  - working / interrupted / pending reply
+  - delivery failures, safety/safeguard issues, stale locks, transcript missing
+  - explicitly labeled sessions
+  - recently active sessions (last N hours)
+- **Labels** (TUI key `R`): write a human-friendly label into config `[labels]` so `ou_...` style ids become readable.

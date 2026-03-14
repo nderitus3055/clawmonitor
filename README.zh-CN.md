@@ -50,6 +50,7 @@ clawmonitor status --detail
 clawmonitor status --format json
 clawmonitor status --format md
 clawmonitor status --format md --detail
+clawmonitor cron
 clawmonitor tree
 clawmonitor report --session-key 'agent:main:main' --format both
 clawmonitor watch --interval 1
@@ -79,7 +80,11 @@ clawmonitor watch --interval 1
 - `↑/↓`：切换选中 session
 - `Enter`：对选中 session 发送 nudge（选择模板）
 - `?`：显示帮助说明
+- `x`：Focus 过滤（隐藏陈旧/不重要 session）
 - `t`：切换树形视图（按 agent 分组）
+- `c`：切换是否在树里显示 cron jobs
+- `R`：重命名/标注当前 session（写入配置 `[labels]`）
+- `n`：切换 NODE 显示模式（`channel:label`）
 - `l`：切换 Related Logs 面板
 - `d`：重新计算诊断（强制刷新）
 - `e`：导出该 session 的脱敏报告（JSON+MD）
