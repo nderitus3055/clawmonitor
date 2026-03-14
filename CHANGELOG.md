@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.7
+
+- TUI: fix occasional “stale characters” artifacts on dynamic lines by padding redraws (prevents leftover fragments like `ounter(line`).
+
 ## 0.1.6
 
 - TUI: Focus filter (`x`) to hide stale/noise sessions; footer shows `sessions=shown/total`.
