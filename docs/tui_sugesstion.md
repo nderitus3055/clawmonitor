@@ -155,6 +155,32 @@ OpenClaw WebUI already has:
 - Sessions page (`ui/src/ui/views/sessions.ts`) driven by `sessions.list`
 - Channels controller using `channels.status` (`ui/src/ui/controllers/channels.ts`)
 
+### Where to put a monitor panel (pure UX discussion)
+
+WebUI can host a richer monitor panel than terminal UIs (wide tables, sorting, multi-column filters, expandable evidence).
+There are three reasonable homes:
+
+Option A — **inside Sessions** (lowest friction):
+
+- Add a “Monitor mode” toggle to the Sessions view.
+- In monitor mode, show extra columns/badges (OUT/THINK/TOOL/FLAGS) and a details drawer per row.
+- Keep default Sessions view as navigation-focused, so the UI doesn’t feel heavier for casual users.
+
+Option B — **a dedicated Monitor tab** (clean separation):
+
+- Add a top-level “Monitor” tab next to Sessions/Usage/Cron.
+- Use the monitor table as the primary screen, with a right-side details panel.
+
+Option C — **inside Agents** (agent-centric health overview):
+
+- Add an “Agent health” panel that aggregates per-agent: WORKING/ALERT counts, last OUT/THINK, delivery failures.
+- Clicking an agent drills into its sessions filtered view.
+
+Recommended path (keep it lightweight but effective):
+
+- Start with **Option A (Sessions + toggle)** and optionally add **Option C (Agent summary)** later.
+- Option B is the best long-term UX once the monitor endpoint exists, but it’s more surface area.
+
 ### Minimal “monitor” in WebUI (low risk)
 
 Option A (fastest):
@@ -217,4 +243,3 @@ Then:
    - useful for debugging silent failures
    - safe to expose (redaction)
    - cheap to compute
-
