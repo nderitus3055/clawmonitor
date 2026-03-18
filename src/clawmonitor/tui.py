@@ -70,6 +70,7 @@ from .redact import redact_text
 from .session_keys import parse_session_key
 from .reports import write_report_files
 from .session_store import SessionMeta, list_sessions
+from .session_history import SessionHistoryResult, TaskHistoryEvent, filter_history_events, history_is_stale, load_session_history
 from .state import SessionComputed, WorkState, WorkingSignal, compute_state
 from .thread_bindings import TelegramThreadBinding, load_telegram_thread_bindings
 from .transcript_tail import TranscriptTail, tail_transcript
@@ -420,6 +421,16 @@ class SessionView:
     # - internal_activity_at: last internal activity timestamp from transcript tail (assistant/tool/non-message)
     human_out_at: Optional[datetime]
     internal_activity_at: Optional[datetime]
+
+
+@dataclass
+class _HistoryPaneState:
+    load_state: str = "not_loaded"  # not_loaded | loading | ready | error
+    result: Optional[SessionHistoryResult] = None
+    error: Optional[str] = None
+    progress_msg: str = ""
+    started_at: Optional[float] = None
+    last_loaded_at: Optional[float] = None
 
 
 class ModelMonitorState:
@@ -774,6 +785,8 @@ class ClawMonitorTUI:
         self.model_scroll = 0
         self.selected_model_key: Optional[str] = None
         self.show_logs = True
+        self.session_detail_mode = "status"
+        self.history_range_days = 1
         self.tree_view = True
         self.show_cron = True
         self.node_show_session_label = False
@@ -807,6 +820,9 @@ class ClawMonitorTUI:
         self._rel_cache_log_count: int = -1
         self._rel_cache_lines: List[str] = []
         self._rel_cache_last_activity: Optional[str] = None
+        self._history_lock = threading.Lock()
+        self._history_states: Dict[str, _HistoryPaneState] = {}
+        self._history_scroll_by_key: Dict[str, int] = {}
         self._last_total_sessions = 0
         self._last_shown_sessions = 0
 
@@ -875,6 +891,84 @@ class ClawMonitorTUI:
             self._model_refresh_progress_step = 0
             self._model_refresh_progress_total = 0
         t = threading.Thread(target=self._model_refresh_worker, name="clawmonitor-model-refresh", daemon=True)
+        t.start()
+
+    def _history_state_for(self, session_key: str) -> _HistoryPaneState:
+        with self._history_lock:
+            cur = self._history_states.get(session_key)
+            if cur is None:
+                cur = _HistoryPaneState()
+                self._history_states[session_key] = cur
+            return cur
+
+    def _history_scroll_for(self, session_key: str) -> int:
+        return max(0, int(self._history_scroll_by_key.get(session_key, 0)))
+
+    def _set_history_scroll(self, session_key: str, value: int) -> None:
+        self._history_scroll_by_key[session_key] = max(0, int(value))
+
+    def _history_worker(self, session_key: str, session_id: str, session_file: Path) -> None:
+        try:
+            result = load_session_history(
+                session_key=session_key,
+                session_id=session_id,
+                session_file=session_file,
+            )
+            err = None
+        except Exception as e:
+            result = None
+            err = str(e)
+        with self._history_lock:
+            if err is None and result is not None:
+                self._history_states[session_key] = _HistoryPaneState(
+                    load_state="ready",
+                    result=result,
+                    error=None,
+                    progress_msg="History ready",
+                    started_at=None,
+                    last_loaded_at=time.time(),
+                )
+            else:
+                prev = self._history_states.get(session_key)
+                self._history_states[session_key] = _HistoryPaneState(
+                    load_state="error",
+                    result=prev.result if prev else None,
+                    error=err or "history load failed",
+                    progress_msg="",
+                    started_at=None,
+                    last_loaded_at=prev.last_loaded_at if prev else None,
+                )
+
+    def _request_history_load(self, sv: SessionView) -> None:
+        if not sv.meta.session_file:
+            with self._history_lock:
+                self._history_states[sv.meta.key] = _HistoryPaneState(
+                    load_state="error",
+                    result=None,
+                    error="session has no transcript file",
+                    progress_msg="",
+                    started_at=None,
+                    last_loaded_at=None,
+                )
+            return
+        with self._history_lock:
+            cur = self._history_states.get(sv.meta.key)
+            if cur and cur.load_state == "loading":
+                return
+            self._history_states[sv.meta.key] = _HistoryPaneState(
+                load_state="loading",
+                result=cur.result if cur else None,
+                error=None,
+                progress_msg="Reading transcript and updating history cache...",
+                started_at=time.time(),
+                last_loaded_at=cur.last_loaded_at if cur else None,
+            )
+        t = threading.Thread(
+            target=self._history_worker,
+            args=(sv.meta.key, sv.meta.session_id, sv.meta.session_file),
+            name=f"clawmonitor-history-{sv.meta.session_id[:8]}",
+            daemon=True,
+        )
         t.start()
 
     def _related_logs_cached(self, sv: SessionView) -> Tuple[List[str], Optional[str]]:
@@ -1521,8 +1615,142 @@ class ClawMonitorTUI:
             lines.extend([f"  reply: {part}" for part in _wrap_lines(redact_text(reply_preview), max(8, width - 10), max_lines=3)])
         return lines
 
+    def _history_events_for_view(self, sv: SessionView) -> Tuple[_HistoryPaneState, List[TaskHistoryEvent], bool]:
+        state = self._history_state_for(sv.meta.key)
+        result = state.result
+        stale = False
+        if result is not None:
+            stale = history_is_stale(result)
+        events = filter_history_events(result.events, days=self.history_range_days) if result else []
+        return state, events, stale
+
+    def _history_kind_attr(self, kind: str, *, selected_live: bool = False) -> int:
+        attr = 0
+        if self._colors_enabled:
+            if kind == "done":
+                attr |= self._color_ok
+            elif kind == "working":
+                attr |= self._color_idle
+            elif kind == "blocked":
+                attr |= self._color_alert
+            elif kind == "started":
+                attr |= self._color_working
+        if selected_live:
+            attr |= curses.A_BOLD | curses.A_REVERSE
+        return attr
+
+    def _history_scroll_limit(self, total_events: int, visible_events: int) -> int:
+        return max(0, total_events - max(1, visible_events))
+
+    def _move_history_scroll(self, sv: Optional[SessionView], delta: int, *, visible_events: int, end: Optional[bool] = None) -> None:
+        if not sv:
+            return
+        _, events, _ = self._history_events_for_view(sv)
+        limit = self._history_scroll_limit(len(events), visible_events)
+        if end is not None:
+            self._set_history_scroll(sv.meta.key, limit if end else 0)
+            return
+        cur = self._history_scroll_for(sv.meta.key)
+        self._set_history_scroll(sv.meta.key, max(0, min(limit, cur + delta)))
+
+    def _draw_history_details(self, stdscr: "curses._CursesWindow", x: int, y: int, h: int, w: int, sv: SessionView) -> None:
+        for j in range(h):
+            self._safe_addnstr(stdscr, y + j, x, " ".ljust(w), w)
+        state, events, stale = self._history_events_for_view(sv)
+        result = state.result
+        live_now = sv.computed.state == WorkState.WORKING
+        blocked_now = live_now and any(ev.kind == "blocked" for ev in events[:2])
+
+        status = state.load_state.upper().replace("_", " ")
+        cache_mode = "-"
+        if result is not None:
+            cache_mode = result.mode.upper()
+        if stale and state.load_state == "ready":
+            status = "READY (STALE)"
+
+        elapsed = ""
+        if state.load_state == "loading" and state.started_at is not None:
+            elapsed = f"  elapsed={int(max(0.0, time.time() - state.started_at))}s"
+
+        header_attr = curses.A_BOLD
+        if blocked_now:
+            header_attr |= self._color_alert if self._colors_enabled else 0
+            header_attr |= curses.A_REVERSE
+        elif state.load_state == "loading":
+            header_attr |= self._color_idle if self._colors_enabled else 0
+        elif state.load_state == "error":
+            header_attr |= self._color_alert if self._colors_enabled else 0
+        elif live_now:
+            header_attr |= self._color_working if self._colors_enabled else 0
+            header_attr |= curses.A_REVERSE
+        else:
+            header_attr |= self._color_ok if self._colors_enabled else 0
+
+        title = f"History  Range={self.history_range_days}d  State={status}  Cache={cache_mode}{elapsed}"
+        self._safe_addnstr(stdscr, y, x, _fit(title, w), w, header_attr)
+        path_text = str(sv.meta.session_file) if sv.meta.session_file else "-"
+        self._safe_addnstr(stdscr, y + 1, x, _fit(f"Transcript: {path_text}", w), w)
+        source_line = "Derived from transcript · best-effort"
+        if live_now:
+            source_line += " · LIVE TASK HISTORY"
+        elif stale:
+            source_line += " · Press [r] to refresh"
+        self._safe_addnstr(stdscr, y + 2, x, _fit(source_line, w), w)
+
+        body_y = y + 4
+        body_h = max(0, h - 5)
+        if body_h <= 0:
+            return
+
+        if state.load_state == "not_loaded" and result is None:
+            self._safe_addnstr(stdscr, body_y, x, "No history loaded. Press [r] to read this session transcript.", w)
+            return
+        if state.load_state == "loading" and result is None:
+            msg = state.progress_msg or "Reading session history..."
+            self._safe_addnstr(stdscr, body_y, x, _fit(msg, w), w, curses.A_BOLD | (self._color_idle if self._colors_enabled else 0))
+            return
+        if state.load_state == "error" and result is None:
+            err = state.error or "history load failed"
+            self._safe_addnstr(stdscr, body_y, x, _fit(f"History error: {err}", w), w, curses.A_BOLD | (self._color_alert if self._colors_enabled else 0))
+            return
+        if not events:
+            text = "No derived task history in the selected window."
+            if state.load_state == "loading":
+                text = state.progress_msg or "Reading session history..."
+            elif state.load_state == "error" and state.error:
+                text = f"History error: {state.error}"
+            self._safe_addnstr(stdscr, body_y, x, _fit(text, w), w)
+            return
+
+        visible_events = max(1, body_h // 2)
+        scroll = self._history_scroll_for(sv.meta.key)
+        limit = self._history_scroll_limit(len(events), visible_events)
+        if scroll > limit:
+            scroll = limit
+            self._set_history_scroll(sv.meta.key, scroll)
+
+        shown = events[scroll : scroll + visible_events]
+        for idx, event in enumerate(shown):
+            row_y = body_y + (idx * 2)
+            if row_y >= y + h:
+                break
+            ts_text = _fmt_dt(event.ts)
+            label = event.kind.upper()
+            line = f"{ts_text}  [{label}]  {event.title}"
+            live_attr = live_now and scroll == 0 and idx == 0 and event.kind in ("working", "blocked")
+            attr = self._history_kind_attr(event.kind, selected_live=live_attr)
+            self._safe_addnstr(stdscr, row_y, x, _fit(line, w), w, attr)
+            if row_y + 1 < y + h:
+                self._safe_addnstr(stdscr, row_y + 1, x, _fit(f"  {event.summary}", w), w)
+
+        footer = f"events={len(events)} scroll={scroll + 1}-{min(len(events), scroll + len(shown))} / {len(events)}  j/k scroll  PgUp/PgDn page  g/G edge"
+        self._safe_addnstr(stdscr, y + h - 1, x, _fit(footer, w), w)
+
     def _draw_details(self, stdscr: "curses._CursesWindow", x: int, y: int, h: int, w: int, sv: Optional[SessionView]) -> None:
         if not sv:
+            return
+        if self.session_detail_mode == "history":
+            self._draw_history_details(stdscr, x=x, y=y, h=h, w=w, sv=sv)
             return
         rel_logs, last_activity = self._related_logs_cached(sv)
 
@@ -2147,14 +2375,15 @@ class ClawMonitorTUI:
             "ClawMonitor TUI Help",
             "",
             "Navigation:",
-            "  ↑/↓ (or k/j)   Select session",
-            "  PgUp/PgDn      Page up / down",
-            "  g / G          Jump to top / bottom",
+            "  ↑/↓            Select session",
+            "  PgUp/PgDn      Page through sessions (status view) or history (history view)",
+            "  g / G          Jump to top / bottom (list or history)",
+            "  j / k          Move down / up in history view",
             "  q or Esc       Quit",
             "",
             "Actions:",
             "  v              Toggle session/model view",
-            "  r              Refresh now",
+            "  r              Refresh now, or load/reload history in History view",
             "  R              Rename/label selected session",
             "  f              Cycle refresh interval (up to 10 minutes)",
             "  t              Toggle tree view (group by agent)",
@@ -2163,7 +2392,9 @@ class ClawMonitorTUI:
             "  x              Toggle Focus filter (hide stale/boring sessions)",
             "  Enter          Send nudge (chat.send) using a template",
             "  e              Export redacted report (JSON+MD)",
-            "  l              Toggle related logs panel",
+            "  h              Toggle right-side Status / History detail mode",
+            "  1 / 7          Set history range to 1 day / 7 days",
+            "  b              Toggle bottom related logs panel",
             "  d              Diagnose selected session (includes silent-gap hints)",
             "",
             "Model view:",
@@ -2392,6 +2623,7 @@ class ClawMonitorTUI:
             sessions = self._apply_session_filter(sessions_all)
             items = self._build_list_items(sessions)
             self._reconcile_selection(items)
+            sv_for_sig = self._selected_session(items)
             model_rows = self.model_monitor.rows
             self._reconcile_model_selection(model_rows)
             with self._refresh_lock:
@@ -2412,7 +2644,22 @@ class ClawMonitorTUI:
                     self._model_refresh_error,
                     self._model_last_refresh_at,
                 )
-            refresh_sig = (self.view_mode, session_sig, model_sig)
+            history_sig = None
+            if self.view_mode == "sessions" and sv_for_sig:
+                hs = self._history_state_for(sv_for_sig.meta.key)
+                history_result = hs.result
+                history_sig = (
+                    self.session_detail_mode,
+                    self.history_range_days,
+                    hs.load_state,
+                    hs.progress_msg,
+                    hs.error,
+                    hs.last_loaded_at,
+                    getattr(history_result, "mode", None),
+                    getattr(history_result, "file_size", None),
+                    getattr(history_result, "file_mtime", None),
+                )
+            refresh_sig = (self.view_mode, session_sig, model_sig, history_sig, self.show_logs)
             if refresh_sig != last_refresh_sig:
                 dirty = True
                 last_refresh_sig = refresh_sig
@@ -2429,39 +2676,76 @@ class ClawMonitorTUI:
                     continue
             h, _ = stdscr.getmaxyx()
             page_step = max(1, h - 6)
+            history_step = max(1, (h - 8) // 2)
             if ch in (ord("q"), 27):
                 return
-            if ch in (curses.KEY_UP, ord("k")):
+            if ch == curses.KEY_UP:
                 if self.view_mode == "models":
                     self._move_model_selection(model_rows, -1)
                 else:
                     self._move_selection(items, -1)
                 dirty = True
-            elif ch in (curses.KEY_DOWN, ord("j")):
+            elif ch == curses.KEY_DOWN:
                 if self.view_mode == "models":
                     self._move_model_selection(model_rows, 1)
                 else:
                     self._move_selection(items, 1)
                 dirty = True
+            elif ch == ord("k"):
+                if self.view_mode == "sessions" and self.session_detail_mode == "history":
+                    self._move_history_scroll(self._selected_session(items), -1, visible_events=history_step)
+                elif self.view_mode == "models":
+                    self._move_model_selection(model_rows, -1)
+                else:
+                    self._move_selection(items, -1)
+                dirty = True
+            elif ch == ord("j"):
+                if self.view_mode == "sessions" and self.session_detail_mode == "history":
+                    self._move_history_scroll(self._selected_session(items), 1, visible_events=history_step)
+                elif self.view_mode == "models":
+                    self._move_model_selection(model_rows, 1)
+                else:
+                    self._move_selection(items, 1)
+                dirty = True
             elif ch in (curses.KEY_PPAGE,):
-                if self.view_mode == "models":
+                if self.view_mode == "sessions" and self.session_detail_mode == "history":
+                    self._move_history_scroll(self._selected_session(items), -history_step, visible_events=history_step)
+                elif self.view_mode == "models":
                     self._move_model_selection(model_rows, -page_step)
                 else:
                     self._move_selection(items, -page_step)
                 dirty = True
             elif ch in (curses.KEY_NPAGE, ord(" ")):
-                if self.view_mode == "models":
+                if self.view_mode == "sessions" and self.session_detail_mode == "history":
+                    self._move_history_scroll(self._selected_session(items), history_step, visible_events=history_step)
+                elif self.view_mode == "models":
                     self._move_model_selection(model_rows, page_step)
                 else:
                     self._move_selection(items, page_step)
                 dirty = True
-            elif ch in (curses.KEY_HOME, ord("g")):
+            elif ch == curses.KEY_HOME or (ch == ord("g") and self.view_mode == "sessions" and self.session_detail_mode == "history"):
+                if self.view_mode == "sessions" and self.session_detail_mode == "history":
+                    self._move_history_scroll(self._selected_session(items), 0, visible_events=history_step, end=False)
+                elif self.view_mode == "models":
+                    self._move_model_to_edge(model_rows, end=False)
+                else:
+                    self._move_selection_to_edge(items, end=False)
+                dirty = True
+            elif ch == curses.KEY_END or (ch == ord("G") and self.view_mode == "sessions" and self.session_detail_mode == "history"):
+                if self.view_mode == "sessions" and self.session_detail_mode == "history":
+                    self._move_history_scroll(self._selected_session(items), 0, visible_events=history_step, end=True)
+                elif self.view_mode == "models":
+                    self._move_model_to_edge(model_rows, end=True)
+                else:
+                    self._move_selection_to_edge(items, end=True)
+                dirty = True
+            elif ch == ord("g"):
                 if self.view_mode == "models":
                     self._move_model_to_edge(model_rows, end=False)
                 else:
                     self._move_selection_to_edge(items, end=False)
                 dirty = True
-            elif ch in (curses.KEY_END, ord("G")):
+            elif ch == ord("G"):
                 if self.view_mode == "models":
                     self._move_model_to_edge(model_rows, end=True)
                 else:
@@ -2471,14 +2755,27 @@ class ClawMonitorTUI:
                 self.view_mode = "models" if self.view_mode == "sessions" else "sessions"
                 dirty = True
             elif ch == ord("r"):
-                if self.view_mode == "models":
+                if self.view_mode == "sessions" and self.session_detail_mode == "history":
+                    sv = self._selected_session(items)
+                    if sv:
+                        self._request_history_load(sv)
+                elif self.view_mode == "models":
                     self._request_model_refresh()
                 else:
                     self._request_refresh()
                     last_refresh = time.time()
                 dirty = True
-            elif ch == ord("l") and self.view_mode == "sessions":
+            elif ch == ord("b") and self.view_mode == "sessions":
                 self.show_logs = not self.show_logs
+                dirty = True
+            elif ch == ord("h") and self.view_mode == "sessions":
+                self.session_detail_mode = "history" if self.session_detail_mode == "status" else "status"
+                dirty = True
+            elif ch == ord("1") and self.view_mode == "sessions":
+                self.history_range_days = 1
+                dirty = True
+            elif ch == ord("7") and self.view_mode == "sessions":
+                self.history_range_days = 7
                 dirty = True
             elif ch == ord("d") and self.view_mode == "sessions":
                 sv = self._selected_session(items)
@@ -2637,17 +2934,30 @@ class ClawMonitorTUI:
                     refresh_note += f"({prog_msg})"
             elif err:
                 refresh_note = f" refreshErr={err[:40]}"
+            history_note = ""
+            if self.view_mode == "sessions" and self.session_detail_mode == "history" and sv:
+                hs, _, stale = self._history_events_for_view(sv)
+                label = hs.load_state.upper().replace("_", " ")
+                if stale and hs.load_state == "ready":
+                    label = "READY/STALE"
+                history_note = f" history={label} range={self.history_range_days}d"
+                if hs.result is not None:
+                    history_note += f" cache={hs.result.mode}"
+                if hs.load_state == "loading" and hs.started_at is not None:
+                    history_note += f" elapsed={int(max(0.0, time.time() - hs.started_at))}s"
             footer = (
                 f"[q]quit [?]help [v]view={self.view_mode} [↑↓]select [PgUp/PgDn]page [g/G]edge [r]refresh "
                 + (
                     (
                         f"[f]interval={int(self.refresh_seconds)}s "
+                        f"[h]{self.session_detail_mode} "
                         f"[t]{'tree' if self.tree_view else 'flat'} [c]{'cron' if self.show_cron else 'nocron'} "
                         f"[x]{'focus' if self.focus_mode else 'all'} "
                         f"[n]{'node:label' if self.node_show_session_label else 'node:plain'} "
-                        f"[R]rename [Enter]nudge [e]export [l]logs  "
+                        f"[1/7]historyRange={self.history_range_days}d "
+                        f"[R]rename [Enter]nudge [e]export [b]bottom  "
                         f"sel={sel_pos}/{sel_total} sessions={self._last_shown_sessions}/{self._last_total_sessions} "
-                        f"lastRefresh={refresh_age}{refresh_note}"
+                        f"lastRefresh={refresh_age}{refresh_note}{history_note}"
                     )
                     if self.view_mode == "sessions"
                     else (
