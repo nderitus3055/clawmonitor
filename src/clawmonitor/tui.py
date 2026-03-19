@@ -787,8 +787,10 @@ class ClawMonitorTUI:
         self.show_logs = True
         self.session_detail_mode = "status"
         self.history_range_days = 1
-        self.pane_zoom_mode = "split"  # split | detail | list
+        self.pane_zoom_mode = "even"  # even | detail | list | sessions
         self.detail_fullscreen = False
+        self._history_selected_by_key: Dict[str, int] = {}
+        self._history_expanded_by_key: Dict[str, bool] = {}
         self.tree_view = True
         self.show_cron = True
         self.node_show_session_label = False
@@ -908,6 +910,18 @@ class ClawMonitorTUI:
 
     def _set_history_scroll(self, session_key: str, value: int) -> None:
         self._history_scroll_by_key[session_key] = max(0, int(value))
+
+    def _history_selected_for(self, session_key: str) -> int:
+        return max(0, int(self._history_selected_by_key.get(session_key, 0)))
+
+    def _set_history_selected(self, session_key: str, value: int) -> None:
+        self._history_selected_by_key[session_key] = max(0, int(value))
+
+    def _history_expanded_for(self, session_key: str) -> bool:
+        return bool(self._history_expanded_by_key.get(session_key, False))
+
+    def _toggle_history_expanded(self, session_key: str) -> None:
+        self._history_expanded_by_key[session_key] = not self._history_expanded_for(session_key)
 
     def _history_worker(self, session_key: str, session_id: str, session_file: Path) -> None:
         try:
@@ -1406,9 +1420,9 @@ class ClawMonitorTUI:
         return text, attr
 
     def _session_list_layout(self, width: int) -> Dict[str, int | bool]:
-        if width < 68:
-            node_w = max(8, min(14, width // 4))
-            state_w = 9
+        if width < 56:
+            node_w = max(7, min(10, width // 5))
+            state_w = 6
             return {
                 "node_w": node_w,
                 "state_w": state_w,
@@ -1418,22 +1432,34 @@ class ClawMonitorTUI:
                 "show_run": False,
                 "show_flags": False,
             }
-        if width < 90:
-            node_w = max(10, min(16, int(width * 0.20)))
-            state_w = 10
-            flags_w = max(8, min(10, int(width * 0.16)))
+        if width < 74:
+            node_w = max(8, min(11, int(width * 0.16)))
+            state_w = 6
+            return {
+                "node_w": node_w,
+                "state_w": state_w,
+                "flags_w": 0,
+                "show_u_age": True,
+                "show_a_age": True,
+                "show_run": True,
+                "show_flags": False,
+            }
+        if width < 92:
+            node_w = max(8, min(12, int(width * 0.16)))
+            state_w = 7
+            flags_w = max(7, min(9, int(width * 0.12)))
             return {
                 "node_w": node_w,
                 "state_w": state_w,
                 "flags_w": flags_w,
-                "show_u_age": False,
-                "show_a_age": False,
-                "show_run": False,
+                "show_u_age": True,
+                "show_a_age": True,
+                "show_run": True,
                 "show_flags": True,
             }
-        node_w = max(10, min(18, int(width * 0.20)))
-        state_w = 11
-        flags_w = max(8, min(12, int(width * 0.16)))
+        node_w = max(9, min(14, int(width * 0.16)))
+        state_w = 8
+        flags_w = max(7, min(10, int(width * 0.12)))
         return {
             "node_w": node_w,
             "state_w": state_w,
@@ -1458,7 +1484,7 @@ class ClawMonitorTUI:
             self._safe_addnstr(stdscr, start_y + idx, 0, line.ljust(width), width, curses.A_REVERSE)
 
     def _cycle_pane_zoom_mode(self) -> None:
-        order = ["split", "detail", "list"]
+        order = ["sessions", "even", "detail", "list"]
         try:
             idx = order.index(self.pane_zoom_mode)
         except ValueError:
@@ -1467,10 +1493,11 @@ class ClawMonitorTUI:
 
     def _pane_zoom_label(self) -> str:
         return {
-            "split": "split",
+            "even": "50/50",
             "detail": "detail",
-            "list": "list",
-        }.get(self.pane_zoom_mode, "split")
+            "list": "left80",
+            "sessions": "left100",
+        }.get(self.pane_zoom_mode, "50/50")
 
     def _draw_list(self, stdscr: "curses._CursesWindow", y: int, h: int, w: int, items: List[ListItem]) -> None:
         layout = self._session_list_layout(w)
@@ -1589,7 +1616,7 @@ class ClawMonitorTUI:
             node_text = f"{indent}- {node_leaf}"
             parts = [
                 _fit(node_text, node_w),
-                _fit(sv.computed.state.value, state_w),
+                _fit(self._state_short_label(sv.computed.state.value), state_w),
             ]
             if bool(layout["show_u_age"]):
                 parts.append(f"{u_age:>5}")
@@ -1603,6 +1630,15 @@ class ClawMonitorTUI:
             line = "  ".join(parts)
             attr = self._row_attr(health_cls, selected=(idx == self.selected))
             self._safe_addnstr(stdscr, row_y, 0, line.ljust(w), w, attr)
+
+    def _state_short_label(self, value: str) -> str:
+        mapping = {
+            "WORKING": "WORK",
+            "FINISHED": "DONE",
+            "INTERRUPTED": "INT",
+            "NO_MESSAGE": "NOMSG",
+        }
+        return mapping.get((value or "").strip(), (value or "").strip()[:8])
 
     def _model_health_class(self, row: ModelRow) -> str:
         status = (row.overall_status or "").strip()
@@ -1747,6 +1783,24 @@ class ClawMonitorTUI:
         cur = self._history_scroll_for(sv.meta.key)
         self._set_history_scroll(sv.meta.key, max(0, min(limit, cur + delta)))
 
+    def _move_history_selection(self, sv: Optional[SessionView], delta: int, *, visible_events: int, end: Optional[bool] = None) -> None:
+        if not sv:
+            return
+        _, events, _ = self._history_events_for_view(sv)
+        if not events:
+            return
+        max_idx = len(events) - 1
+        if end is not None:
+            idx = max_idx if end else 0
+        else:
+            idx = max(0, min(max_idx, self._history_selected_for(sv.meta.key) + delta))
+        self._set_history_selected(sv.meta.key, idx)
+        scroll = self._history_scroll_for(sv.meta.key)
+        if idx < scroll:
+            self._set_history_scroll(sv.meta.key, idx)
+        elif idx >= scroll + visible_events:
+            self._set_history_scroll(sv.meta.key, max(0, idx - visible_events + 1))
+
     def _draw_history_details(self, stdscr: "curses._CursesWindow", x: int, y: int, h: int, w: int, sv: SessionView) -> None:
         for j in range(h):
             self._safe_addnstr(stdscr, y + j, x, " ".ljust(w), w)
@@ -1819,7 +1873,11 @@ class ClawMonitorTUI:
             self._safe_addnstr(stdscr, body_y, x, _fit(text, w), w)
             return
 
-        visible_events = max(1, body_h // 2)
+        selected_idx = min(len(events) - 1, self._history_selected_for(sv.meta.key))
+        self._set_history_selected(sv.meta.key, selected_idx)
+        expanded = self._history_expanded_for(sv.meta.key)
+        reserved_lines = 3 if expanded and events else 0
+        visible_events = max(1, (body_h - reserved_lines) // 2)
         scroll = self._history_scroll_for(sv.meta.key)
         limit = self._history_scroll_limit(len(events), visible_events)
         if scroll > limit:
@@ -1833,14 +1891,37 @@ class ClawMonitorTUI:
                 break
             ts_text = _fmt_dt(event.ts)
             label = event.kind.upper()
-            line = f"{ts_text}  [{label}]  {event.title}"
-            live_attr = live_now and scroll == 0 and idx == 0 and event.kind in ("working", "blocked")
+            absolute_idx = scroll + idx
+            prefix = ">" if absolute_idx == selected_idx else " "
+            line = f"{prefix} {ts_text}  [{label}]  {event.title}"
+            live_attr = (live_now and absolute_idx == 0 and event.kind in ("working", "blocked")) or absolute_idx == selected_idx
             attr = self._history_kind_attr(event.kind, selected_live=live_attr)
             self._safe_addnstr(stdscr, row_y, x, _fit(line, w), w, attr)
             if row_y + 1 < y + h:
                 self._safe_addnstr(stdscr, row_y + 1, x, _fit(f"  {event.summary}", w), w)
 
-        footer = f"events={len(events)} scroll={scroll + 1}-{min(len(events), scroll + len(shown))} / {len(events)}  j/k scroll  PgUp/PgDn page  g/G edge"
+        detail_y = body_y + max(1, len(shown) * 2)
+        if expanded and 0 <= selected_idx < len(events) and detail_y < y + h - 1:
+            selected = events[selected_idx]
+            self._safe_addnstr(
+                stdscr,
+                detail_y,
+                x,
+                _fit(f"Expanded [{selected.kind.upper()}]  Press [Enter] or [Space] to collapse.", w),
+                w,
+                curses.A_BOLD | self._history_kind_attr(selected.kind),
+            )
+            detail_lines = _wrap_lines(selected.summary, max(8, w - 2), max_lines=max(1, y + h - detail_y - 2))
+            for i, part in enumerate(detail_lines):
+                if detail_y + 1 + i >= y + h - 1:
+                    break
+                self._safe_addnstr(stdscr, detail_y + 1 + i, x, _fit(f"  {part}", w), w)
+
+        footer = (
+            f"events={len(events)} sel={selected_idx + 1}/{len(events)} "
+            f"scroll={scroll + 1}-{min(len(events), scroll + len(shown))}  "
+            f"j/k select  Enter expand  PgUp/PgDn page  g/G edge"
+        )
         self._safe_addnstr(stdscr, y + h - 1, x, _fit(footer, w), w)
 
     def _draw_details(self, stdscr: "curses._CursesWindow", x: int, y: int, h: int, w: int, sv: Optional[SessionView]) -> None:
@@ -2491,7 +2572,7 @@ class ClawMonitorTUI:
             "  ↑/↓            Select session",
             "  PgUp/PgDn      Page through sessions (status view) or history (history view)",
             "  g / G          Jump to top / bottom (list or history)",
-            "  j / k          Move down / up in history view",
+            "  j / k          Select previous / next history item",
             "  q or Esc       Quit",
             "",
             "Actions:",
@@ -2499,7 +2580,7 @@ class ClawMonitorTUI:
             "  r              Refresh now, or load/reload history in History view",
             "  R              Rename/label selected session",
             "  f              Cycle refresh interval (up to 10 minutes)",
-            "  z              Cycle pane layout: split -> detail -> list",
+            "  z              Cycle pane layout: left100 -> 50/50 -> detail -> left80",
             "  Z              Fullscreen detail pane",
             "  t              Toggle tree view (group by agent)",
             "  c              Toggle cron jobs in tree view",
@@ -2510,6 +2591,7 @@ class ClawMonitorTUI:
             "  h              Toggle right-side Status / History detail mode",
             "  1 / 7          Set history range to 1 day / 7 days",
             "  b              Toggle bottom related logs panel",
+            "  Enter          Expand/collapse selected history item",
             "  d              Diagnose selected session (includes silent-gap hints)",
             "",
             "Tip:",
@@ -2559,7 +2641,7 @@ class ClawMonitorTUI:
             "  - Reports/logs are redacted, but review before sharing.",
             "",
             "Help Navigation:",
-            "  ↑/↓ or j/k     Scroll line by line",
+            "  ↑/↓ or j/k     Scroll/select depending on view",
             "  PgUp/PgDn      Scroll page by page",
             "  g / G          Jump to start / end",
             "",
@@ -2838,7 +2920,7 @@ class ClawMonitorTUI:
                 dirty = True
             elif ch == ord("k"):
                 if self.view_mode == "sessions" and self.session_detail_mode == "history":
-                    self._move_history_scroll(self._selected_session(items), -1, visible_events=history_step)
+                    self._move_history_selection(self._selected_session(items), -1, visible_events=history_step)
                 elif self.view_mode == "models":
                     self._move_model_selection(model_rows, -1)
                 else:
@@ -2846,7 +2928,7 @@ class ClawMonitorTUI:
                 dirty = True
             elif ch == ord("j"):
                 if self.view_mode == "sessions" and self.session_detail_mode == "history":
-                    self._move_history_scroll(self._selected_session(items), 1, visible_events=history_step)
+                    self._move_history_selection(self._selected_session(items), 1, visible_events=history_step)
                 elif self.view_mode == "models":
                     self._move_model_selection(model_rows, 1)
                 else:
@@ -2854,7 +2936,7 @@ class ClawMonitorTUI:
                 dirty = True
             elif ch in (curses.KEY_PPAGE,):
                 if self.view_mode == "sessions" and self.session_detail_mode == "history":
-                    self._move_history_scroll(self._selected_session(items), -history_step, visible_events=history_step)
+                    self._move_history_selection(self._selected_session(items), -history_step, visible_events=history_step)
                 elif self.view_mode == "models":
                     self._move_model_selection(model_rows, -page_step)
                 else:
@@ -2862,7 +2944,7 @@ class ClawMonitorTUI:
                 dirty = True
             elif ch in (curses.KEY_NPAGE, ord(" ")):
                 if self.view_mode == "sessions" and self.session_detail_mode == "history":
-                    self._move_history_scroll(self._selected_session(items), history_step, visible_events=history_step)
+                    self._move_history_selection(self._selected_session(items), history_step, visible_events=history_step)
                 elif self.view_mode == "models":
                     self._move_model_selection(model_rows, page_step)
                 else:
@@ -2870,7 +2952,7 @@ class ClawMonitorTUI:
                 dirty = True
             elif ch == curses.KEY_HOME or (ch == ord("g") and self.view_mode == "sessions" and self.session_detail_mode == "history"):
                 if self.view_mode == "sessions" and self.session_detail_mode == "history":
-                    self._move_history_scroll(self._selected_session(items), 0, visible_events=history_step, end=False)
+                    self._move_history_selection(self._selected_session(items), 0, visible_events=history_step, end=False)
                 elif self.view_mode == "models":
                     self._move_model_to_edge(model_rows, end=False)
                 else:
@@ -2878,7 +2960,7 @@ class ClawMonitorTUI:
                 dirty = True
             elif ch == curses.KEY_END or (ch == ord("G") and self.view_mode == "sessions" and self.session_detail_mode == "history"):
                 if self.view_mode == "sessions" and self.session_detail_mode == "history":
-                    self._move_history_scroll(self._selected_session(items), 0, visible_events=history_step, end=True)
+                    self._move_history_selection(self._selected_session(items), 0, visible_events=history_step, end=True)
                 elif self.view_mode == "models":
                     self._move_model_to_edge(model_rows, end=True)
                 else:
@@ -2968,7 +3050,10 @@ class ClawMonitorTUI:
             elif ch in (ord("e"), 10, 13):
                 if self.view_mode == "sessions":
                     sv = self._selected_session(items)
-                    if ch == ord("e") and sv:
+                    if ch in (10, 13) and self.session_detail_mode == "history" and sv:
+                        self._toggle_history_expanded(sv.meta.key)
+                        dirty = True
+                    elif ch == ord("e") and sv:
                         self._export_report(sv)
                         dirty = True
                     elif ch in (10, 13) and sv:
@@ -3012,6 +3097,10 @@ class ClawMonitorTUI:
             if self.view_mode == "sessions":
                 if self.detail_fullscreen:
                     list_w = 0
+                elif self.pane_zoom_mode == "sessions":
+                    list_w = w
+                elif self.pane_zoom_mode == "even":
+                    list_w = max(36, min(max(36, int(w * 0.50)), max(0, w - 26)))
                 elif self.pane_zoom_mode == "detail":
                     if self.session_detail_mode == "history":
                         list_w = max(22, min(30, max(22, int(w * 0.24))))
@@ -3047,6 +3136,16 @@ class ClawMonitorTUI:
                 sv = self._selected_session(items)
                 if self.detail_fullscreen:
                     self._draw_details(stdscr, x=0, y=content_y, h=h - content_y - footer_h, w=w, sv=sv)
+                elif self.pane_zoom_mode == "sessions":
+                    self._draw_list(stdscr, y=content_y, h=list_h, w=w, items=items)
+                    self._safe_addnstr(
+                        stdscr,
+                        warning_y,
+                        0,
+                        "LEFT LIST FOCUS ACTIVE  Press [z] for 50/50/detail/left80, or [Z] for fullscreen detail.".ljust(w),
+                        w,
+                        curses.A_BOLD | (self._color_working if self._colors_enabled else 0),
+                    )
                 else:
                     self._draw_list(stdscr, y=content_y, h=list_h, w=list_w, items=items)
                     if detail_w >= 24 and list_w < w - 1:
@@ -3140,7 +3239,7 @@ class ClawMonitorTUI:
                 footer_lines.append(
                     f"detail={self.session_detail_mode} panes={self._pane_zoom_label()} fullscreen={'on' if self.detail_fullscreen else 'off'} "
                     f"sel={sel_pos}/{sel_total} sessions={self._last_shown_sessions}/{self._last_total_sessions} "
-                    f"lastRefresh={refresh_age}{refresh_note}{history_note}  tip=[z] cycle panes [Z] fullscreen [?] help, press [?] again for full"
+                    f"lastRefresh={refresh_age}{refresh_note}{history_note}  tip=[z] left100/50-50/detail/left80 [Z] right100 [?] help, press [?] again for full"
                 )
             else:
                 footer_lines.append(
