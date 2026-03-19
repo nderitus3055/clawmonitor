@@ -71,6 +71,7 @@ from .session_keys import parse_session_key
 from .reports import write_report_files
 from .session_store import SessionMeta, list_sessions
 from .session_history import SessionHistoryResult, TaskHistoryEvent, filter_history_events, history_is_stale, load_session_history
+from .session_usage import SessionUsageRangeEntry, SessionUsageRangeResult, fetch_sessions_usage_range, history_usage_is_stale
 from .state import SessionComputed, WorkState, WorkingSignal, compute_state
 from .thread_bindings import TelegramThreadBinding, load_telegram_thread_bindings
 from .transcript_tail import TranscriptTail, tail_transcript
@@ -457,6 +458,16 @@ class _HistoryPaneState:
     last_loaded_at: Optional[float] = None
 
 
+@dataclass
+class _TokenUsagePaneState:
+    load_state: str = "not_loaded"  # not_loaded | loading | ready | error
+    result: Optional[SessionUsageRangeResult] = None
+    error: Optional[str] = None
+    progress_msg: str = ""
+    started_at: Optional[float] = None
+    last_loaded_at: Optional[float] = None
+
+
 class ModelMonitorState:
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
@@ -811,6 +822,7 @@ class ClawMonitorTUI:
         self.show_logs = True
         self.session_detail_mode = "status"
         self.session_metric_page = "activity"
+        self.session_token_window_days = 0  # 0=current snapshot; otherwise usage range days
         self.history_range_days = 1
         self.pane_zoom_mode = "even"  # even | detail | list | sessions
         self.detail_fullscreen = False
@@ -854,6 +866,8 @@ class ClawMonitorTUI:
         self._history_lock = threading.Lock()
         self._history_states: Dict[str, _HistoryPaneState] = {}
         self._history_scroll_by_key: Dict[str, int] = {}
+        self._token_usage_lock = threading.Lock()
+        self._token_usage_states: Dict[int, _TokenUsagePaneState] = {}
         self._last_total_sessions = 0
         self._last_shown_sessions = 0
 
@@ -1013,6 +1027,77 @@ class ClawMonitorTUI:
             daemon=True,
         )
         t.start()
+
+    def _token_usage_state_for(self, days: int) -> _TokenUsagePaneState:
+        key = max(1, int(days))
+        with self._token_usage_lock:
+            cur = self._token_usage_states.get(key)
+            if cur is None:
+                cur = _TokenUsagePaneState()
+                self._token_usage_states[key] = cur
+            return cur
+
+    def _token_usage_worker(self, days: int) -> None:
+        try:
+            result = fetch_sessions_usage_range(self.cfg.openclaw_bin, days=days)
+            err = None
+        except Exception as e:
+            result = None
+            err = str(e)
+        with self._token_usage_lock:
+            prev = self._token_usage_states.get(days)
+            if err is None and result is not None:
+                self._token_usage_states[days] = _TokenUsagePaneState(
+                    load_state="ready",
+                    result=result,
+                    error=None,
+                    progress_msg="Usage ready",
+                    started_at=None,
+                    last_loaded_at=time.time(),
+                )
+            else:
+                self._token_usage_states[days] = _TokenUsagePaneState(
+                    load_state="error",
+                    result=prev.result if prev else None,
+                    error=err or "usage load failed",
+                    progress_msg="",
+                    started_at=None,
+                    last_loaded_at=prev.last_loaded_at if prev else None,
+                )
+
+    def _request_token_usage_load(self, days: int) -> None:
+        if days <= 0:
+            return
+        with self._token_usage_lock:
+            cur = self._token_usage_states.get(days)
+            if cur and cur.load_state == "loading":
+                return
+            self._token_usage_states[days] = _TokenUsagePaneState(
+                load_state="loading",
+                result=cur.result if cur else None,
+                error=None,
+                progress_msg=f"Loading {days}d token usage from Gateway...",
+                started_at=time.time(),
+                last_loaded_at=cur.last_loaded_at if cur else None,
+            )
+        t = threading.Thread(
+            target=self._token_usage_worker,
+            args=(days,),
+            name=f"clawmonitor-token-usage-{days}d",
+            daemon=True,
+        )
+        t.start()
+
+    def _token_usage_entry_for_session(
+        self, sv: SessionView
+    ) -> Tuple[Optional[_TokenUsagePaneState], Optional[SessionUsageRangeEntry], bool]:
+        if self.session_token_window_days <= 0:
+            return None, None, False
+        state = self._token_usage_state_for(self.session_token_window_days)
+        result = state.result
+        entry = result.sessions_by_key.get(sv.meta.key) if result else None
+        stale = history_usage_is_stale(state.last_loaded_at) if state.load_state == "ready" else False
+        return state, entry, stale
 
     def _related_logs_cached(self, sv: SessionView) -> Tuple[List[str], Optional[str]]:
         if not self.show_logs:
@@ -1485,6 +1570,38 @@ class ClawMonitorTUI:
         )
         return [line1, line2]
 
+    def _session_range_usage_lines(self, sv: SessionView) -> List[str]:
+        state, entry, stale = self._token_usage_entry_for_session(sv)
+        if state is None:
+            return []
+        status = "WAITING" if state.load_state == "not_loaded" else state.load_state.upper().replace("_", " ")
+        if stale and state.load_state == "ready":
+            status = "READY/STALE"
+        elapsed = ""
+        if state.load_state == "loading" and state.started_at is not None:
+            elapsed = f" elapsed={int(max(0.0, time.time() - state.started_at))}s"
+        head = f"Usage {self.session_token_window_days}d: {status}{elapsed}"
+        if state.load_state == "not_loaded":
+            return [f"{head}  Press [r] to load Gateway usage."]
+        if state.load_state == "loading":
+            return [f"{head}  {state.progress_msg or ''}".strip()]
+        if state.load_state == "error":
+            return [f"{head}  {state.error or 'usage load failed'}"]
+        if entry is None:
+            return [f"{head}  No usage row for this session in the selected window."]
+        totals = entry.totals
+        line1 = (
+            f"{head}  in={_fmt_tokens_short(totals.input_tokens)} "
+            f"out={_fmt_tokens_short(totals.output_tokens)} "
+            f"cache={_fmt_tokens_short(totals.cache_read_tokens + totals.cache_write_tokens)} "
+            f"total={_fmt_tokens_short(totals.total_tokens)}"
+        )
+        line2 = (
+            f"UsageCost {self.session_token_window_days}d: ${totals.total_cost:.3f} "
+            f"msgs={totals.message_count} errors={totals.error_count}"
+        )
+        return [line1, line2]
+
     def _session_list_layout(self, width: int) -> Dict[str, int | bool | str]:
         page = self.session_metric_page
         if page == "tokens":
@@ -1629,10 +1746,15 @@ class ClawMonitorTUI:
     def _session_metric_pages(self) -> List[str]:
         return ["activity", "tokens"]
 
+    def _token_window_label(self) -> str:
+        if self.session_token_window_days <= 0:
+            return "now"
+        return f"{self.session_token_window_days}d"
+
     def _session_metric_page_label(self) -> str:
         return {
             "activity": "activity",
-            "tokens": "tokens-now",
+            "tokens": f"tokens-{self._token_window_label()}",
         }.get(self.session_metric_page, self.session_metric_page)
 
     def _cycle_session_metric_page(self, delta: int) -> None:
@@ -1643,11 +1765,20 @@ class ClawMonitorTUI:
             idx = 0
         self.session_metric_page = pages[(idx + delta) % len(pages)]
 
+    def _cycle_session_token_window(self) -> None:
+        windows = [0, 1, 7, 30]
+        try:
+            idx = windows.index(self.session_token_window_days)
+        except ValueError:
+            idx = 0
+        self.session_token_window_days = windows[(idx + 1) % len(windows)]
+
     def _surface_is_default(self) -> bool:
         return (
             self.view_mode == "sessions"
             and self.session_detail_mode == "status"
             and self.session_metric_page == "activity"
+            and self.session_token_window_days == 0
             and self.pane_zoom_mode == "even"
             and not self.detail_fullscreen
         )
@@ -1656,6 +1787,7 @@ class ClawMonitorTUI:
         self.view_mode = "sessions"
         self.session_detail_mode = "status"
         self.session_metric_page = "activity"
+        self.session_token_window_days = 0
         self.pane_zoom_mode = "even"
         self.detail_fullscreen = False
 
@@ -1723,6 +1855,9 @@ class ClawMonitorTUI:
         node_w = int(layout["node_w"])
         state_w = int(layout["state_w"])
         page = str(layout.get("page") or "activity")
+        range_result: Optional[SessionUsageRangeResult] = None
+        if page == "tokens" and self.session_token_window_days > 0:
+            range_result = self._token_usage_state_for(self.session_token_window_days).result
         header_parts = [_fit("NODE", node_w), _fit("STATE", state_w)]
         flags_w = int(layout.get("flags_w") or 0)
         if page == "tokens":
@@ -1733,7 +1868,7 @@ class ClawMonitorTUI:
             if bool(layout["show_tok_cache"]):
                 header_parts.append(_fit("CACHE", int(layout["tok_cache_w"])))
             if bool(layout["show_tok_ctx"]):
-                header_parts.append(_fit("CTX", int(layout["tok_ctx_w"])))
+                header_parts.append(_fit("TOT" if self.session_token_window_days > 0 else "CTX", int(layout["tok_ctx_w"])))
         else:
             if bool(layout["show_u_age"]):
                 header_parts.append("USER")
@@ -1859,14 +1994,22 @@ class ClawMonitorTUI:
                 _fit(self._state_short_label(sv.computed.state.value), state_w),
             ]
             if page == "tokens":
+                range_entry = range_result.sessions_by_key.get(sv.meta.key) if range_result else None
                 if bool(layout["show_tok_in"]):
-                    parts.append(_fit(_fmt_tokens_short(sv.meta.input_tokens), int(layout["tok_in_w"])))
+                    text = _fmt_tokens_short(range_entry.totals.input_tokens) if self.session_token_window_days > 0 and range_entry else (_fmt_tokens_short(sv.meta.input_tokens) if self.session_token_window_days == 0 else "-")
+                    parts.append(_fit(text, int(layout["tok_in_w"])))
                 if bool(layout["show_tok_out"]):
-                    parts.append(_fit(_fmt_tokens_short(sv.meta.output_tokens), int(layout["tok_out_w"])))
+                    text = _fmt_tokens_short(range_entry.totals.output_tokens) if self.session_token_window_days > 0 and range_entry else (_fmt_tokens_short(sv.meta.output_tokens) if self.session_token_window_days == 0 else "-")
+                    parts.append(_fit(text, int(layout["tok_out_w"])))
                 if bool(layout["show_tok_cache"]):
-                    parts.append(_fit(_fmt_tokens_short(self._session_cache_tokens(sv)), int(layout["tok_cache_w"])))
+                    text = _fmt_tokens_short(range_entry.totals.cache_read_tokens + range_entry.totals.cache_write_tokens) if self.session_token_window_days > 0 and range_entry else (_fmt_tokens_short(self._session_cache_tokens(sv)) if self.session_token_window_days == 0 else "-")
+                    parts.append(_fit(text, int(layout["tok_cache_w"])))
                 if bool(layout["show_tok_ctx"]):
-                    parts.append(_fit(self._session_context_pct(sv), int(layout["tok_ctx_w"])))
+                    if self.session_token_window_days > 0:
+                        text = _fmt_tokens_short(range_entry.totals.total_tokens) if range_entry else "-"
+                    else:
+                        text = self._session_context_pct(sv)
+                    parts.append(_fit(text, int(layout["tok_ctx_w"])))
             else:
                 if bool(layout["show_u_age"]):
                     parts.append(f"{u_age:>5}")
@@ -2334,6 +2477,7 @@ class ClawMonitorTUI:
             )
         lines.append(f"State: {sv.computed.state.value}  Reason: {sv.computed.reason}")
         lines.extend(self._session_usage_lines(sv))
+        lines.extend(self._session_range_usage_lines(sv))
         if sv.lock:
             lines.append(f"Lock: pid={sv.lock.pid} alive={sv.lock.pid_alive} createdAt={_fmt_dt(sv.lock.created_at)}")
         else:
@@ -2410,6 +2554,7 @@ class ClawMonitorTUI:
             f"State: {sv.computed.state.value}  Reason: {sv.computed.reason}",
         ]
         status_lines.extend(self._session_usage_lines(sv))
+        status_lines.extend(self._session_range_usage_lines(sv))
         cron_job = match_cron_job(self.model.cron_snapshot, sv.meta.key)
         if cron_job:
             label = cron_job.name or cron_job.id
@@ -2522,7 +2667,7 @@ class ClawMonitorTUI:
             attr = 0
             if ln.startswith(("Task:", "Thinking:", "Trigger:", "ToolCall:", "ToolResult:")):
                 attr = self._color_magenta if self._colors_enabled else 0
-            elif ln.startswith(("Token:", "Context:")):
+            elif ln.startswith(("Token:", "Context:", "Usage ", "UsageCost ")):
                 attr = curses.A_BOLD | (self._color_idle if self._colors_enabled else 0)
             elif ln.startswith("Diagnosis:"):
                 if not self._colors_enabled:
@@ -2637,6 +2782,7 @@ class ClawMonitorTUI:
             f"State: {sv.computed.state.value}  Reason: {sv.computed.reason}",
         ]
         status_lines.extend(self._session_usage_lines(sv))
+        status_lines.extend(self._session_range_usage_lines(sv))
         cron_job = match_cron_job(self.model.cron_snapshot, sv.meta.key)
         if cron_job:
             label = cron_job.name or cron_job.id
@@ -2703,7 +2849,7 @@ class ClawMonitorTUI:
             attr = 0
             if ln.startswith(("Task:", "Thinking:", "Trigger:")):
                 attr = self._color_magenta if self._colors_enabled else 0
-            elif ln.startswith(("Token:", "Context:")):
+            elif ln.startswith(("Token:", "Context:", "Usage ", "UsageCost ")):
                 attr = curses.A_BOLD | (self._color_idle if self._colors_enabled else 0)
             self._safe_addnstr(stdscr, y_status + 1 + i, x, _fit(ln, w), w, attr)
 
@@ -2909,6 +3055,8 @@ class ClawMonitorTUI:
             "  h              Toggle Status / History",
             "  r              Refresh, or load/reload History",
             "  ← / →          Switch left-list metric columns (activity / tokens)",
+            "  u              Cycle token window now / 1d / 7d / 30d",
+            "  0 / 1 / 7 / 3  Set token window now / 1d / 7d / 30d (token page)",
             "  1 / 7          History range 1 day / 7 days",
             "  b              Bottom panel toggle",
             "",
@@ -2960,12 +3108,15 @@ class ClawMonitorTUI:
             "Performance:",
             "  - Refresh runs asynchronously; footer shows refresh progress/errors.",
             "  - Related Logs are cached per session to keep ↑/↓ selection responsive.",
+            "  - Token NOW reads local sessions.json only and is cheap.",
+            "  - Token 1d/7d/30d uses Gateway sessions.usage and is loaded on demand with [r].",
             "",
             "Left list columns:",
             "  Frozen columns: NODE, STATE",
             "  Metric pages: activity(USER/ASST/RUN/FLAGS) or tokens(IN/OUT/CACHE/CTX)",
             "  Use ← / → to switch column pages.",
             "  Token page: IN=input, OUT=output, CACHE=cache read+write, CTX=prompt/context percent.",
+            "  Range token page swaps CTX for TOT and shows selected window totals.",
             "  (SESSION is the sessionKey tail; may be truncated in narrow terminals)",
             "",
             "FLAGS column (compact):",
@@ -3221,6 +3372,7 @@ class ClawMonitorTUI:
                     self._model_last_refresh_at,
                 )
             history_sig = None
+            token_sig = None
             if self.view_mode == "sessions" and sv_for_sig:
                 hs = self._history_state_for(sv_for_sig.meta.key)
                 history_result = hs.result
@@ -3235,7 +3387,19 @@ class ClawMonitorTUI:
                     getattr(history_result, "file_size", None),
                     getattr(history_result, "file_mtime", None),
                 )
-            refresh_sig = (self.view_mode, session_sig, model_sig, history_sig, self.show_logs)
+            if self.view_mode == "sessions" and self.session_token_window_days > 0:
+                tus = self._token_usage_state_for(self.session_token_window_days)
+                token_result = tus.result
+                token_sig = (
+                    self.session_token_window_days,
+                    tus.load_state,
+                    tus.progress_msg,
+                    tus.error,
+                    tus.last_loaded_at,
+                    getattr(token_result, "updated_at_ms", None),
+                    len(token_result.sessions_by_key) if token_result else None,
+                )
+            refresh_sig = (self.view_mode, session_sig, model_sig, history_sig, token_sig, self.show_logs)
             if refresh_sig != last_refresh_sig:
                 dirty = True
                 last_refresh_sig = refresh_sig
@@ -3353,6 +3517,8 @@ class ClawMonitorTUI:
                     sv = self._selected_session(items)
                     if sv:
                         self._request_history_load(sv)
+                elif self.view_mode == "sessions" and self.session_metric_page == "tokens" and self.session_token_window_days > 0:
+                    self._request_token_usage_load(self.session_token_window_days)
                 elif self.view_mode == "models":
                     self._request_model_refresh()
                 else:
@@ -3374,11 +3540,29 @@ class ClawMonitorTUI:
                 self.detail_fullscreen = not self.detail_fullscreen
                 dirty = True
             elif ch == ord("1") and self.view_mode == "sessions":
-                self.history_range_days = 1
+                if self.session_detail_mode == "history":
+                    self.history_range_days = 1
+                elif self.session_metric_page == "tokens":
+                    self.session_token_window_days = 1
                 dirty = True
+            elif ch == ord("3") and self.view_mode == "sessions":
+                if self.session_metric_page == "tokens":
+                    self.session_token_window_days = 30
+                    dirty = True
             elif ch == ord("7") and self.view_mode == "sessions":
-                self.history_range_days = 7
+                if self.session_detail_mode == "history":
+                    self.history_range_days = 7
+                elif self.session_metric_page == "tokens":
+                    self.session_token_window_days = 7
                 dirty = True
+            elif ch == ord("0") and self.view_mode == "sessions":
+                if self.session_metric_page == "tokens":
+                    self.session_token_window_days = 0
+                    dirty = True
+            elif ch == ord("u") and self.view_mode == "sessions":
+                if self.session_metric_page == "tokens":
+                    self._cycle_session_token_window()
+                    dirty = True
             elif ch == ord("d") and self.view_mode == "sessions":
                 sv = self._selected_session(items)
                 if sv:
@@ -3582,12 +3766,32 @@ class ClawMonitorTUI:
                     history_note += f" cache={hs.result.mode}"
                 if hs.load_state == "loading" and hs.started_at is not None:
                     history_note += f" elapsed={int(max(0.0, time.time() - hs.started_at))}s"
+            token_note = ""
+            if self.view_mode == "sessions" and self.session_metric_page == "tokens":
+                if self.session_token_window_days <= 0:
+                    token_note = " usage=NOW(snapshot)"
+                else:
+                    tus = self._token_usage_state_for(self.session_token_window_days)
+                    label = "WAITING" if tus.load_state == "not_loaded" else tus.load_state.upper().replace("_", " ")
+                    if tus.load_state == "ready" and history_usage_is_stale(tus.last_loaded_at):
+                        label = "READY/STALE"
+                    token_note = f" usage={label} range={self.session_token_window_days}d"
+                    if tus.load_state == "loading" and tus.started_at is not None:
+                        token_note += f" elapsed={int(max(0.0, time.time() - tus.started_at))}s"
+            refresh_label = "refresh"
+            if self.view_mode == "sessions" and self.session_detail_mode == "history":
+                refresh_label = "loadHist"
+            elif self.view_mode == "sessions" and self.session_metric_page == "tokens" and self.session_token_window_days > 0:
+                refresh_label = "loadUsage"
+            elif self.view_mode == "models":
+                refresh_label = "probe"
             footer = (
-                f"[q]quit [?]help [v]view={self.view_mode} [↑↓]select [PgUp/PgDn]page [g/G]edge [r]refresh "
+                f"[q]quit [?]help [v]view={self.view_mode} [↑↓]select [PgUp/PgDn]page [g/G]edge [r]{refresh_label} "
                 + (
                     (
                         (
                             f"[←/→]cols "
+                            f"[u]tokenWindow={self._token_window_label()} "
                             f"[f]interval={int(self.refresh_seconds)}s "
                             f"[h]{self.session_detail_mode} "
                             f"[cols]{self._session_metric_page_label()} "
@@ -3602,6 +3806,7 @@ class ClawMonitorTUI:
                         if self.session_detail_mode == "history"
                         else
                         f"[←/→]cols "
+                        f"[u]tokenWindow={self._token_window_label()} "
                         f"[f]interval={int(self.refresh_seconds)}s "
                         f"[h]{self.session_detail_mode} "
                         f"[cols]{self._session_metric_page_label()} "
@@ -3625,11 +3830,11 @@ class ClawMonitorTUI:
                 if self.session_detail_mode == "history":
                     tip = "tip=[←/→] cols [j/k] history [Enter] detail [7] wider-window [r] reload [Esc] reset [jj/kk] agent jump"
                 else:
-                    tip = "tip=[←/→] cols [h] history [b] bottom [z] panes [Z] fullscreen [Esc] reset [jj/kk] agent jump"
+                    tip = "tip=[←/→] cols [u] token-window [0/1/7/3] set-window [r] load-usage [h] history [Esc] reset [jj/kk] agent jump"
                 footer_lines.append(
                     f"detail={self.session_detail_mode} cols={self._session_metric_page_label()} panes={self._pane_zoom_label()} fullscreen={'on' if self.detail_fullscreen else 'off'} "
                     f"sel={sel_pos}/{sel_total} sessions={self._last_shown_sessions}/{self._last_total_sessions} "
-                    f"lastRefresh={refresh_age}{refresh_note}{history_note}  {tip}"
+                    f"lastRefresh={refresh_age}{refresh_note}{history_note}{token_note}  {tip}"
                 )
             else:
                 footer_lines.append(
