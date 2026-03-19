@@ -787,7 +787,7 @@ class ClawMonitorTUI:
         self.show_logs = True
         self.session_detail_mode = "status"
         self.history_range_days = 1
-        self.detail_zoom = False
+        self.pane_zoom_mode = "split"  # split | detail | list
         self.detail_fullscreen = False
         self.tree_view = True
         self.show_cron = True
@@ -1457,6 +1457,21 @@ class ClawMonitorTUI:
         for idx, line in enumerate(render_lines):
             self._safe_addnstr(stdscr, start_y + idx, 0, line.ljust(width), width, curses.A_REVERSE)
 
+    def _cycle_pane_zoom_mode(self) -> None:
+        order = ["split", "detail", "list"]
+        try:
+            idx = order.index(self.pane_zoom_mode)
+        except ValueError:
+            idx = 0
+        self.pane_zoom_mode = order[(idx + 1) % len(order)]
+
+    def _pane_zoom_label(self) -> str:
+        return {
+            "split": "split",
+            "detail": "detail",
+            "list": "list",
+        }.get(self.pane_zoom_mode, "split")
+
     def _draw_list(self, stdscr: "curses._CursesWindow", y: int, h: int, w: int, items: List[ListItem]) -> None:
         layout = self._session_list_layout(w)
         node_w = int(layout["node_w"])
@@ -1464,9 +1479,9 @@ class ClawMonitorTUI:
         flags_w = int(layout["flags_w"])
         header_parts = [_fit("NODE", node_w), _fit("STATE", state_w)]
         if bool(layout["show_u_age"]):
-            header_parts.append("U-AGE")
+            header_parts.append("USER")
         if bool(layout["show_a_age"]):
-            header_parts.append("A-AGE")
+            header_parts.append("ASST")
         if bool(layout["show_run"]):
             header_parts.append("RUN")
         if bool(layout["show_flags"]):
@@ -2466,7 +2481,7 @@ class ClawMonitorTUI:
             "",
             "Top Actions:",
             "  [?]            Help (press [?] again here for FULL help)",
-            "  z / Z          Zoom right pane / fullscreen detail",
+            "  z / Z          Cycle split/detail/list panes / fullscreen detail",
             "  h              Toggle Status / History",
             "  r              Refresh, or load/reload History",
             "  1 / 7          History range 1 day / 7 days",
@@ -2484,7 +2499,7 @@ class ClawMonitorTUI:
             "  r              Refresh now, or load/reload history in History view",
             "  R              Rename/label selected session",
             "  f              Cycle refresh interval (up to 10 minutes)",
-            "  z              Zoom right-side detail pane",
+            "  z              Cycle pane layout: split -> detail -> list",
             "  Z              Fullscreen detail pane",
             "  t              Toggle tree view (group by agent)",
             "  c              Toggle cron jobs in tree view",
@@ -2519,7 +2534,7 @@ class ClawMonitorTUI:
             "  - Related Logs are cached per session to keep ↑/↓ selection responsive.",
             "",
             "Left list columns:",
-            "  NODE, STATE, U-AGE, A-AGE, RUN, FLAGS, SESSION",
+            "  NODE, STATE, USER, ASST, RUN, FLAGS, SESSION",
             "  (SESSION is the sessionKey tail; may be truncated in narrow terminals)",
             "",
             "FLAGS column (compact):",
@@ -2902,7 +2917,7 @@ class ClawMonitorTUI:
                 self.session_detail_mode = "history" if self.session_detail_mode == "status" else "status"
                 dirty = True
             elif ch == ord("z") and self.view_mode == "sessions":
-                self.detail_zoom = not self.detail_zoom
+                self._cycle_pane_zoom_mode()
                 dirty = True
             elif ch == ord("Z") and self.view_mode == "sessions":
                 self.detail_fullscreen = not self.detail_fullscreen
@@ -2997,11 +3012,13 @@ class ClawMonitorTUI:
             if self.view_mode == "sessions":
                 if self.detail_fullscreen:
                     list_w = 0
-                elif self.detail_zoom:
+                elif self.pane_zoom_mode == "detail":
                     if self.session_detail_mode == "history":
                         list_w = max(22, min(30, max(22, int(w * 0.24))))
                     else:
                         list_w = max(24, min(36, max(24, int(w * 0.28))))
+                elif self.pane_zoom_mode == "list":
+                    list_w = max(56, min(max(56, int(w * 0.64)), max(0, w - 24)))
                 else:
                     list_w = max(40, min(max(40, int(w * 0.46)), max(0, w - 28)))
             else:
@@ -3103,7 +3120,7 @@ class ClawMonitorTUI:
                     (
                         f"[f]interval={int(self.refresh_seconds)}s "
                         f"[h]{self.session_detail_mode} "
-                        f"[z]{'zoom' if self.detail_zoom else 'split'} "
+                        f"[z]{self._pane_zoom_label()} "
                         f"[Z]{'full' if self.detail_fullscreen else 'pane'} "
                         f"[t]{'tree' if self.tree_view else 'flat'} [c]{'cron' if self.show_cron else 'nocron'} "
                         f"[x]{'focus' if self.focus_mode else 'all'} "
@@ -3121,9 +3138,9 @@ class ClawMonitorTUI:
             footer_lines = [footer]
             if self.view_mode == "sessions":
                 footer_lines.append(
-                    f"detail={self.session_detail_mode} zoom={'on' if self.detail_zoom else 'off'} fullscreen={'on' if self.detail_fullscreen else 'off'} "
+                    f"detail={self.session_detail_mode} panes={self._pane_zoom_label()} fullscreen={'on' if self.detail_fullscreen else 'off'} "
                     f"sel={sel_pos}/{sel_total} sessions={self._last_shown_sessions}/{self._last_total_sessions} "
-                    f"lastRefresh={refresh_age}{refresh_note}{history_note}  tip=[?] help, press [?] again for full"
+                    f"lastRefresh={refresh_age}{refresh_note}{history_note}  tip=[z] cycle panes [Z] fullscreen [?] help, press [?] again for full"
                 )
             else:
                 footer_lines.append(
