@@ -1088,6 +1088,18 @@ class ClawMonitorTUI:
         )
         t.start()
 
+    def _maybe_request_token_usage_load(self, days: int, *, reload_stale: bool = True) -> None:
+        if days <= 0:
+            return
+        state = self._token_usage_state_for(days)
+        if state.load_state == "loading":
+            return
+        if state.result is None or state.load_state in ("not_loaded", "error"):
+            self._request_token_usage_load(days)
+            return
+        if reload_stale and history_usage_is_stale(state.last_loaded_at):
+            self._request_token_usage_load(days)
+
     def _token_usage_entry_for_session(
         self, sv: SessionView
     ) -> Tuple[Optional[_TokenUsagePaneState], Optional[SessionUsageRangeEntry], bool]:
@@ -1535,6 +1547,35 @@ class ClawMonitorTUI:
             return text, attr
         text = "MODEL PROBE: WAITING  Press [r] to start probing configured models."
         attr = curses.A_BOLD | (self._color_idle if self._colors_enabled else 0)
+        return text, attr
+
+    def _token_banner(self) -> Optional[Tuple[str, int]]:
+        if self.view_mode != "sessions" or self.session_metric_page != "tokens":
+            return None
+        if self.session_token_window_days <= 0:
+            text = "TOKEN VIEW: NOW  local sessions.json snapshot  [u] window  [←/→] columns"
+            attr = curses.A_BOLD | (self._color_ok if self._colors_enabled else 0)
+            return text, attr
+        state = self._token_usage_state_for(self.session_token_window_days)
+        label = "WAITING" if state.load_state == "not_loaded" else state.load_state.upper().replace("_", " ")
+        if state.load_state == "ready" and history_usage_is_stale(state.last_loaded_at):
+            label = "READY/STALE"
+        elapsed = ""
+        if state.load_state == "loading" and state.started_at is not None:
+            elapsed = f" elapsed={int(max(0.0, time.time() - state.started_at))}s"
+        detail = state.progress_msg or state.error or ""
+        text = (
+            f"TOKEN USAGE {self.session_token_window_days}D: {label}{elapsed}  "
+            f"{detail or '[u] window  [r] reload  [←/→] columns'}"
+        )
+        if state.load_state == "loading":
+            attr = curses.A_BOLD | (self._color_working if self._colors_enabled else 0)
+        elif state.load_state == "error":
+            attr = curses.A_BOLD | (self._color_alert if self._colors_enabled else 0)
+        elif label == "READY/STALE":
+            attr = curses.A_BOLD | (self._color_idle if self._colors_enabled else 0)
+        else:
+            attr = curses.A_BOLD | (self._color_ok if self._colors_enabled else 0)
         return text, attr
 
     def _session_cache_tokens(self, sv: SessionView) -> Optional[int]:
@@ -3433,9 +3474,13 @@ class ClawMonitorTUI:
                 dirty = True
             elif ch == curses.KEY_LEFT and self.view_mode == "sessions":
                 self._cycle_session_metric_page(-1)
+                if self.session_metric_page == "tokens" and self.session_token_window_days > 0:
+                    self._maybe_request_token_usage_load(self.session_token_window_days)
                 dirty = True
             elif ch == curses.KEY_RIGHT and self.view_mode == "sessions":
                 self._cycle_session_metric_page(1)
+                if self.session_metric_page == "tokens" and self.session_token_window_days > 0:
+                    self._maybe_request_token_usage_load(self.session_token_window_days)
                 dirty = True
             elif ch == curses.KEY_DOWN:
                 if self.view_mode == "models":
@@ -3544,16 +3589,19 @@ class ClawMonitorTUI:
                     self.history_range_days = 1
                 elif self.session_metric_page == "tokens":
                     self.session_token_window_days = 1
+                    self._maybe_request_token_usage_load(self.session_token_window_days)
                 dirty = True
             elif ch == ord("3") and self.view_mode == "sessions":
                 if self.session_metric_page == "tokens":
                     self.session_token_window_days = 30
+                    self._maybe_request_token_usage_load(self.session_token_window_days)
                     dirty = True
             elif ch == ord("7") and self.view_mode == "sessions":
                 if self.session_detail_mode == "history":
                     self.history_range_days = 7
                 elif self.session_metric_page == "tokens":
                     self.session_token_window_days = 7
+                    self._maybe_request_token_usage_load(self.session_token_window_days)
                 dirty = True
             elif ch == ord("0") and self.view_mode == "sessions":
                 if self.session_metric_page == "tokens":
@@ -3562,6 +3610,8 @@ class ClawMonitorTUI:
             elif ch == ord("u") and self.view_mode == "sessions":
                 if self.session_metric_page == "tokens":
                     self._cycle_session_token_window()
+                    if self.session_token_window_days > 0:
+                        self._maybe_request_token_usage_load(self.session_token_window_days)
                     dirty = True
             elif ch == ord("d") and self.view_mode == "sessions":
                 sv = self._selected_session(items)
@@ -3647,6 +3697,13 @@ class ClawMonitorTUI:
                 self._safe_addnstr(stdscr, 2, 0, banner.ljust(w), w, banner_attr)
                 content_y = 3
                 list_h = h - content_y - footer_h
+            elif self.view_mode == "sessions":
+                token_banner = self._token_banner()
+                if token_banner is not None:
+                    banner, banner_attr = token_banner
+                    self._safe_addnstr(stdscr, 2, 0, banner.ljust(w), w, banner_attr)
+                    content_y = 3
+                    list_h = h - content_y - footer_h
             if self.view_mode == "sessions":
                 if self.detail_fullscreen:
                     list_w = 0
